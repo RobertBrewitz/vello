@@ -70,21 +70,21 @@ struct RenderState {
 /// pipeline from paths to strips that can be rendered by the GPU.
 #[derive(Debug)]
 pub struct Scene {
-    pub(crate) width: u16,
-    pub(crate) height: u16,
-    pub(crate) wide: Wide<MODE_HYBRID>,
-    pub(crate) paint: PaintType,
-    pub(crate) paint_transform: Affine,
-    pub(crate) aliasing_threshold: Option<u8>,
-    pub(crate) encoded_paints: Vec<EncodedPaint>,
+    pub width: u16,
+    pub height: u16,
+    pub wide: Wide<MODE_HYBRID>,
+    pub paint: PaintType,
+    pub paint_transform: Affine,
+    pub aliasing_threshold: Option<u8>,
+    pub encoded_paints: Vec<EncodedPaint>,
     paint_visible: bool,
-    pub(crate) stroke: Stroke,
-    pub(crate) transform: Affine,
-    pub(crate) fill_rule: Fill,
-    pub(crate) blend_mode: BlendMode,
-    pub(crate) strip_generator: StripGenerator,
-    pub(crate) strip_storage: StripStorage,
-    pub(crate) glyph_caches: Option<vello_common::glyph::GlyphCaches>,
+    pub stroke: Stroke,
+    pub transform: Affine,
+    pub fill_rule: Fill,
+    pub blend_mode: BlendMode,
+    pub strip_generator: StripGenerator,
+    pub strip_storage: StripStorage,
+    pub glyph_caches: Option<vello_common::glyph::GlyphCaches>,
 }
 
 impl Scene {
