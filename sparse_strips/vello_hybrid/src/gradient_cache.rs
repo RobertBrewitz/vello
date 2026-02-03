@@ -2,6 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
 //! Gradient ramp cache for `vello_hybrid` renderer.
+//!
+//! Gradient LUTs persist across frames.  When a gradient is requested that
+//! already exists in the cache the existing offset is returned and no GPU
+//! re-upload is needed.  At the end of each frame, gradients not used that
+//! frame are evicted and the buffer is compacted.
 
 use alloc::vec::Vec;
 use hashbrown::HashMap;
@@ -14,90 +19,81 @@ use vello_common::peniko::color::cache_key::CacheKey;
 /// This constant is used to convert between byte offsets and texel indices.
 const BYTES_PER_TEXEL: u32 = 4;
 
+/// Packed gradient look-up tables that persist across frames.
 #[derive(Debug)]
 pub(crate) struct GradientRampCache {
-    /// Current epoch for LRU tracking.
-    epoch: u64,
-    /// Cache mapping gradient signature to cached ramps and last access time.
-    cache: HashMap<CacheKey<GradientCacheKey>, (CachedRamp, u64)>,
+    /// Cache mapping gradient key to its ramp location and last-used epoch.
+    cache: HashMap<CacheKey<GradientCacheKey>, CachedRamp>,
     /// Packed gradient luts.
     luts: Vec<u8>,
     /// Whether the packed luts needs to be re-uploaded.
     has_changed: bool,
-    /// Maximum number of gradient cache entries to retain.
-    retained_count: u32,
+    /// Current frame epoch, incremented each frame in `maintain()`.
+    epoch: u64,
     /// SIMD level used for gradient LUT generation.
     level: Level,
-    /// Scratch space for maintaining the cache.
-    scratch: ScratchSpace,
-}
-
-/// Reusable working memory for cache maintenance operations.
-///
-/// This struct implements a memory pool pattern to avoid repeated allocations
-/// during cache eviction and compaction. Each vector is borrowed during
-/// operations and returned with its capacity preserved for future reuse.
-#[derive(Debug, Default)]
-struct ScratchSpace {
-    /// Temporary storage for cache entries during LRU sorting.
-    /// Holds (`key_reference`, `last_used_timestamp`) pairs for all cache entries.
-    entries: Vec<(&'static CacheKey<GradientCacheKey>, u64)>,
-    /// Temporary storage for cache keys that need to be removed.
-    /// Collects the keys of the LRU entries before removal.
-    removed: Vec<CacheKey<GradientCacheKey>>,
-    /// Temporary storage for evicted cache entries and their ramp data.
-    /// Contains (`key`, `ramp`) pairs for entries that have been removed from the cache.
-    /// Used during LUT compaction to know which ramp data to remove from the packed LUTs.
-    lru_entries: Vec<(CacheKey<GradientCacheKey>, CachedRamp)>,
 }
 
 impl GradientRampCache {
-    /// Create a new gradient ramp cache with the specified retained count.
-    pub(crate) fn new(retained_count: u32, level: Level) -> Self {
+    /// Create a new gradient ramp cache.
+    pub(crate) fn new(level: Level) -> Self {
         Self {
-            epoch: 0,
             cache: HashMap::new(),
             luts: Vec::new(),
             has_changed: false,
-            retained_count,
+            epoch: 0,
             level,
-            scratch: ScratchSpace::default(),
         }
     }
 
-    /// Get or generate a gradient ramp, returning its offset in the packed luts.
+    /// Get or generate a gradient ramp, returning its (`lut_start`, `width`) in the packed luts.
     #[allow(
         clippy::cast_possible_truncation,
         reason = "Conversion from usize to u32 is safe, used for texture coordinates"
     )]
     pub(crate) fn get_or_create_ramp(&mut self, gradient: &EncodedGradient) -> (u32, u32) {
-        self.epoch += 1;
-
-        // Check if we already have this gradient cached.
-        if let Some((cached_ramp, last_used)) = self.cache.get_mut(&gradient.cache_key) {
-            *last_used = self.epoch;
-            return (cached_ramp.lut_start, cached_ramp.width);
+        if let Some(ramp) = self.cache.get_mut(&gradient.cache_key) {
+            ramp.last_used = self.epoch;
+            return (ramp.lut_start, ramp.width);
         }
 
         // Generate new gradient LUT.
         let lut_start = self.luts.len() as u32 / BYTES_PER_TEXEL;
         let width = dispatch!(self.level, simd => generate_gradient_lut_impl(simd, gradient, &mut self.luts))
             as u32;
-        let cached_ramp = CachedRamp { width, lut_start };
+        self.cache.insert(
+            gradient.cache_key.clone(),
+            CachedRamp {
+                lut_start,
+                width,
+                last_used: self.epoch,
+            },
+        );
         self.has_changed = true;
-        self.cache
-            .insert(gradient.cache_key.clone(), (cached_ramp, self.epoch));
-
         (lut_start, width)
     }
 
-    /// Maintain the gradient cache by evicting old entries.
+    /// End-of-frame maintenance: evict unused entries and compact the buffer.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "Conversion from usize to u32 is safe, used for texture coordinates"
+    )]
     pub(crate) fn maintain(&mut self) {
-        let entries_to_remove_count = self
-            .cache
-            .len()
-            .saturating_sub(self.retained_count as usize);
-        self.evict(entries_to_remove_count);
+        let len_before = self.cache.len();
+        self.cache.retain(|_, r| r.last_used >= self.epoch);
+        if self.cache.len() < len_before {
+            // Rebuild the LUT buffer compactly from surviving entries.
+            let mut new_luts = Vec::with_capacity(self.luts.len());
+            for (_, ramp) in self.cache.iter_mut() {
+                let src_start = (ramp.lut_start * BYTES_PER_TEXEL) as usize;
+                let src_end = src_start + (ramp.width * BYTES_PER_TEXEL) as usize;
+                ramp.lut_start = new_luts.len() as u32 / BYTES_PER_TEXEL;
+                new_luts.extend_from_slice(&self.luts[src_start..src_end]);
+            }
+            self.luts = new_luts;
+            self.has_changed = true;
+        }
+        self.epoch += 1;
     }
 
     /// Get the size of the packed luts.
@@ -129,136 +125,17 @@ impl GradientRampCache {
     pub(crate) fn restore_luts(&mut self, luts: Vec<u8>) {
         self.luts = luts;
     }
-
-    /// Remove multiple LRU entries and compact the LUTs vector.
-    fn evict(&mut self, count: usize) {
-        if count == 0 {
-            return;
-        }
-
-        let mut lru_entries = core::mem::take(&mut self.scratch.lru_entries);
-        lru_entries.clear();
-        self.remove_lru_entries(count, &mut lru_entries);
-        self.compact_luts(&mut lru_entries);
-        self.scratch.lru_entries = lru_entries;
-        self.has_changed = true;
-    }
-
-    /// Identify and remove the LRU cache entries.
-    fn remove_lru_entries(
-        &mut self,
-        count: usize,
-        lru_entries: &mut Vec<(CacheKey<GradientCacheKey>, CachedRamp)>,
-    ) {
-        if count == 0 || self.cache.is_empty() {
-            return;
-        }
-
-        let mut entries = reuse_vec(core::mem::take(&mut self.scratch.entries));
-        entries.extend(
-            self.cache
-                .iter()
-                .map(|(key, (_, last_used))| (key, *last_used)),
-        );
-
-        // Sort by last_used (ascending) to get LRU entries first
-        entries.sort_by_key(|(_, last_used)| *last_used);
-
-        let mut removed = core::mem::take(&mut self.scratch.removed);
-        removed.clear();
-        removed.extend(entries.iter().take(count).map(|(key, _)| (*key).clone()));
-        self.scratch.entries = reuse_vec(entries);
-
-        for key in removed.drain(..) {
-            let ramp = self.cache.remove(&key).unwrap().0;
-            lru_entries.push((key, ramp));
-        }
-
-        self.scratch.removed = removed;
-    }
-
-    /// Remove LUT data for evicted entries with compacting the LUTs vector, and update remaining offsets.
-    fn compact_luts(&mut self, ramps_to_remove: &mut [(CacheKey<GradientCacheKey>, CachedRamp)]) {
-        if ramps_to_remove.is_empty() {
-            return;
-        }
-
-        // Sort by lut_start position (ascending) for efficient processing
-        ramps_to_remove.sort_by_key(|(_, ramp)| ramp.lut_start);
-
-        // Convert to byte ranges for easier processing
-        let mut ranges_to_remove = ramps_to_remove
-            .iter()
-            .map(|(_, ramp)| {
-                let start = (ramp.lut_start * BYTES_PER_TEXEL) as usize;
-                let end = start + (ramp.width * BYTES_PER_TEXEL) as usize;
-                (start, end)
-            })
-            .peekable();
-
-        // Total bytes removed so far
-        let mut write_offset = 0;
-        // Current read position
-        let mut read_pos = 0;
-
-        while read_pos < self.luts.len() {
-            // Check if we're at the start of a range to remove
-            if ranges_to_remove.peek().is_some() && read_pos == ranges_to_remove.peek().unwrap().0 {
-                let (start, end) = ranges_to_remove.next().unwrap();
-                // Skip over the range to remove
-                write_offset += end - start;
-                read_pos = end;
-            } else {
-                // Copy byte from read position to write position (read_pos - write_offset)
-                if write_offset > 0 {
-                    self.luts[read_pos - write_offset] = self.luts[read_pos];
-                }
-                read_pos += 1;
-            }
-        }
-
-        // Truncate the vector to remove the unused tail
-        self.luts.truncate(self.luts.len() - write_offset);
-
-        // Update lut_start values for remaining entries
-        // Calculate how much data was removed before each ramp's original position
-        for (_, (ramp, _)) in self.cache.iter_mut() {
-            let mut removed_before = 0;
-            for (_, removed_ramp) in ramps_to_remove.iter() {
-                if removed_ramp.lut_start < ramp.lut_start {
-                    removed_before += removed_ramp.width;
-                }
-            }
-            ramp.lut_start -= removed_before;
-        }
-    }
 }
 
-/// Used to reinterpret the lifetimes of a vector.
-// For how this works, see:
-// https://davidlattimore.github.io/posts/2025/09/02/rustforge-wild-performance-tricks.html
-fn reuse_vec<T, U>(mut v: Vec<T>) -> Vec<U> {
-    const {
-        assert!(
-            size_of::<T>() == size_of::<U>(),
-            "Types must have the same size for safe reinterpretation"
-        );
-        assert!(
-            align_of::<T>() == align_of::<U>(),
-            "Types must have the same alignment for safe reinterpretation"
-        );
-    }
-    v.clear();
-    v.into_iter().map(|_x| unreachable!()).collect()
-}
-
-/// Cached gradient ramp data with metadata.
+/// Cached gradient ramp location in the packed LUT buffer.
 #[derive(Debug, Clone)]
-pub(crate) struct CachedRamp {
-    /// Width of this gradient's LUT.
-    pub width: u32,
-    /// Offset in luts where this ramp starts.
-    pub lut_start: u32,
+struct CachedRamp {
+    /// Width of this gradient's LUT in texels.
+    width: u32,
+    /// Offset in the packed LUT buffer where this ramp starts (in texels).
+    lut_start: u32,
+    /// Epoch when this ramp was last used.
+    last_used: u64,
 }
 
 /// Generate the gradient LUT.
@@ -288,18 +165,9 @@ mod tests {
     use vello_common::kurbo::{Affine, Point};
     use vello_common::peniko::{Color, ColorStop, ColorStops, Gradient, LinearGradientPosition};
 
-    fn insert_entries(cache: &mut GradientRampCache, count: usize) {
-        for i in 0..count {
-            let offset = i as f32 / count as f32;
-
-            let gradient: Gradient = create_gradient(offset);
-            insert_entry(cache, gradient);
-        }
-    }
-
-    fn insert_entry(cache: &mut GradientRampCache, gradient: Gradient) {
+    fn insert_entry(cache: &mut GradientRampCache, gradient: Gradient) -> (u32, u32) {
         let encoded_gradient = create_encoded_gradient(gradient);
-        cache.get_or_create_ramp(&encoded_gradient);
+        cache.get_or_create_ramp(&encoded_gradient)
     }
 
     fn create_encoded_gradient(gradient: Gradient) -> EncodedGradient {
@@ -342,214 +210,178 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_empty() {
-        let mut cache = GradientRampCache::new(5, Level::baseline());
-        cache.maintain();
-
-        assert_eq!(cache.cache.len(), 0);
-        assert_eq!(cache.epoch, 0);
+    fn test_empty() {
+        let cache = GradientRampCache::new(Level::baseline());
         assert!(cache.is_empty());
         assert!(!cache.has_changed());
     }
 
     #[test]
-    fn test_unique_entry_creation() {
-        let mut cache = GradientRampCache::new(5, Level::baseline());
-        insert_entries(&mut cache, 4);
-        cache.maintain();
+    fn test_insert_creates_lut_data() {
+        let mut cache = GradientRampCache::new(Level::baseline());
+        let (start, width) = insert_entry(&mut cache, create_gradient(0.5));
 
-        assert_eq!(cache.cache.len(), 4);
+        assert_eq!(start, 0);
+        assert!(width > 0);
         assert!(!cache.is_empty());
         assert!(cache.has_changed());
+        assert_eq!(cache.luts_size(), (width * BYTES_PER_TEXEL) as usize);
     }
 
     #[test]
-    fn test_no_eviction_under_limit() {
-        let mut cache = GradientRampCache::new(5, Level::baseline());
-        insert_entries(&mut cache, 4);
-        cache.maintain();
+    fn test_cache_hit_no_buffer_growth() {
+        let mut cache = GradientRampCache::new(Level::baseline());
+        let (start1, width1) = insert_entry(&mut cache, create_gradient(0.5));
+        let size_after_first = cache.luts_size();
 
-        assert_eq!(cache.cache.len(), 4);
+        cache.mark_synced();
+        cache.maintain();
+        let (start2, width2) = insert_entry(&mut cache, create_gradient(0.5));
+
+        assert_eq!(start1, start2);
+        assert_eq!(width1, width2);
+        assert_eq!(cache.luts_size(), size_after_first);
+        assert!(!cache.has_changed());
     }
 
     #[test]
-    fn test_no_eviction_at_limit() {
-        let mut cache = GradientRampCache::new(5, Level::baseline());
-        insert_entries(&mut cache, 5);
-        cache.maintain();
+    fn test_multiple_inserts_are_contiguous() {
+        let mut cache = GradientRampCache::new(Level::baseline());
 
-        assert_eq!(cache.cache.len(), 5);
+        let (start1, width1) = insert_entry(&mut cache, create_gradient(0.1));
+        let (start2, width2) = insert_entry(&mut cache, create_gradient(0.2));
+        let (start3, _width3) = insert_entry(&mut cache, create_gradient(0.3));
+
+        assert_eq!(start1, 0);
+        assert_eq!(start2, start1 + width1);
+        assert_eq!(start3, start2 + width2);
     }
 
     #[test]
-    fn test_eviction_over_limit() {
-        let mut cache = GradientRampCache::new(5, Level::baseline());
-        insert_entries(&mut cache, 10);
+    fn test_static_scene_no_reupload() {
+        let mut cache = GradientRampCache::new(Level::baseline());
+
+        // Frame 1: insert gradients, then maintain.
+        insert_entry(&mut cache, create_gradient(0.1));
+        insert_entry(&mut cache, create_gradient(0.2));
+        assert!(cache.has_changed());
+        cache.mark_synced();
         cache.maintain();
 
-        // Should trigger eviction since we're over the limit
-        assert_eq!(cache.cache.len(), 5);
-    }
-
-    #[test]
-    fn test_lut_compaction_and_offset_updates() {
-        let mut cache = GradientRampCache::new(2, Level::baseline());
-
-        // Start from 1 to keep LUT sizes consistent, making it easier to test LUT size
-        // before and after eviction.
-        for i in 1..3 {
-            let gradient = create_gradient(i as f32 / 10.0);
-            insert_entry(&mut cache, gradient);
-        }
-        let initial_luts_size = cache.luts_size();
-
-        // This should evict the LRU entry and compact the luts
-        for i in 3..5 {
-            let gradient = create_gradient(i as f32 / 10.0);
-            insert_entry(&mut cache, gradient);
-        }
+        // Frame 2: same gradients — all cache hits.
+        insert_entry(&mut cache, create_gradient(0.1));
+        insert_entry(&mut cache, create_gradient(0.2));
         cache.maintain();
-        assert_eq!(cache.cache.len(), 2);
-
-        // Verify that luts vector was compacted properly
-        assert_eq!(cache.luts_size(), initial_luts_size);
-
-        // Verify that remaining entries have valid, updated offsets
-        let mut offsets = Vec::new();
-        for (_, (ramp, _)) in &cache.cache {
-            offsets.push((ramp.lut_start, ramp.width));
-        }
-        offsets.sort();
-
-        // The first entry should start at 0 after compaction
-        assert_eq!(offsets[0].0, 0);
-        // Each subsequent entry should start where the previous one ended
-        for i in 1..offsets.len() {
-            let expected_start = offsets[i - 1].0 + offsets[i - 1].1;
-            assert_eq!(offsets[i].0, expected_start);
-        }
-
-        // Total luts size should match sum of all widths * BYTES_PER_TEXEL
-        let total_width: u32 = offsets.iter().map(|(_, width)| width).sum();
-        assert_eq!(cache.luts.len(), (total_width * BYTES_PER_TEXEL) as usize);
-    }
-
-    #[test]
-    fn test_correct_lru_eviction() {
-        let mut cache = GradientRampCache::new(3, Level::baseline());
-
-        // Insert 3 gradients to fill the cache
-        let gradient1 = create_gradient(0.1);
-        let gradient2 = create_gradient(0.2);
-        let gradient3 = create_gradient(0.3);
-
-        insert_entry(&mut cache, gradient1.clone());
-        insert_entry(&mut cache, gradient2.clone());
-        insert_entry(&mut cache, gradient3.clone());
-
-        assert_eq!(cache.cache.len(), 3);
-
-        // Access gradient1 and gradient3 to make them more recently used
-        // This should make gradient2 the least recently used
-        insert_entry(&mut cache, gradient1.clone());
-        insert_entry(&mut cache, gradient3.clone());
-
-        // Now insert a new gradient that should evict gradient2
-        let gradient4 = create_gradient(0.4);
-        insert_entry(&mut cache, gradient4.clone());
-        cache.maintain();
-
-        // Cache should still have 3 entries
-        assert_eq!(cache.cache.len(), 3);
-
-        // Check gradient1 is still cached
-        let encoded_gradient1 = create_encoded_gradient(gradient1);
         assert!(
-            cache.cache.contains_key(&encoded_gradient1.cache_key),
-            "Gradient1 should still be cached"
+            !cache.has_changed(),
+            "Static scene should not trigger re-upload"
+        );
+    }
+
+    #[test]
+    fn test_stale_entries_evicted() {
+        let mut cache = GradientRampCache::new(Level::baseline());
+
+        // Frame 1: insert A and B.
+        insert_entry(&mut cache, create_gradient(0.1));
+        insert_entry(&mut cache, create_gradient(0.2));
+        let size_with_two = cache.luts_size();
+        cache.mark_synced();
+        cache.maintain();
+
+        // Frame 2: only use A. B becomes stale.
+        insert_entry(&mut cache, create_gradient(0.1));
+        cache.maintain();
+
+        assert!(cache.has_changed(), "Eviction should trigger re-upload");
+        assert!(
+            cache.luts_size() < size_with_two,
+            "Buffer should shrink after evicting stale entry"
+        );
+    }
+
+    #[test]
+    fn test_dynamic_gradients_dont_accumulate() {
+        let mut cache = GradientRampCache::new(Level::baseline());
+
+        // Frame 1: gradient A.
+        let (_, width_a) = insert_entry(&mut cache, create_gradient(0.1));
+        let size_a = (width_a * BYTES_PER_TEXEL) as usize;
+        cache.mark_synced();
+        cache.maintain();
+
+        // Frame 2: completely different gradient B. A should be evicted.
+        let (_, width_b) = insert_entry(&mut cache, create_gradient(0.2));
+        let size_b = (width_b * BYTES_PER_TEXEL) as usize;
+        cache.maintain();
+
+        // Buffer should contain only B, not A+B.
+        assert_eq!(cache.luts_size(), size_b);
+        assert!(
+            cache.luts_size() <= size_a + size_b,
+            "Buffer should not contain both A and B"
+        );
+    }
+
+    #[test]
+    fn test_compaction_offset_correctness() {
+        let mut cache = GradientRampCache::new(Level::baseline());
+
+        // Frame 1: insert A, B, C contiguously.
+        let (start_a, width_a) = insert_entry(&mut cache, create_gradient(0.1));
+        let (start_b, _width_b) = insert_entry(&mut cache, create_gradient(0.2));
+        let (_start_c, width_c) = insert_entry(&mut cache, create_gradient(0.3));
+
+        assert_eq!(start_a, 0);
+        assert!(start_b > start_a);
+        cache.mark_synced();
+        cache.maintain();
+
+        // Frame 2: use A and C but not B. B should be evicted.
+        let encoded_a = create_encoded_gradient(create_gradient(0.1));
+        let encoded_c = create_encoded_gradient(create_gradient(0.3));
+        cache.get_or_create_ramp(&encoded_a);
+        cache.get_or_create_ramp(&encoded_c);
+        cache.maintain();
+
+        // Re-read offsets after compaction (maintain updated lut_start in-place).
+        let (new_start_a, new_width_a) = cache.get_or_create_ramp(&encoded_a);
+        let (new_start_c, new_width_c) = cache.get_or_create_ramp(&encoded_c);
+
+        // Widths should be unchanged.
+        assert_eq!(new_width_a, width_a);
+        assert_eq!(new_width_c, width_c);
+
+        // After compaction, entries should be contiguous starting from 0.
+        let mut offsets = [(new_start_a, new_width_a), (new_start_c, new_width_c)];
+        offsets.sort_by_key(|(start, _)| *start);
+
+        assert_eq!(offsets[0].0, 0, "First entry should start at 0 after compaction");
+        assert_eq!(
+            offsets[1].0,
+            offsets[0].0 + offsets[0].1,
+            "Entries should be contiguous after compaction"
         );
 
-        // Check gradient2 was evicted
-        let encoded_gradient2 = create_encoded_gradient(gradient2);
-        assert!(
-            !cache.cache.contains_key(&encoded_gradient2.cache_key),
-            "Gradient2 should have been evicted"
-        );
-
-        // Check gradient3 is still cached
-        let encoded_gradient3 = create_encoded_gradient(gradient3);
-        assert!(
-            cache.cache.contains_key(&encoded_gradient3.cache_key),
-            "Gradient3 should still be cached"
-        );
-
-        // Check gradient4 is cached
-        let encoded_gradient4 = create_encoded_gradient(gradient4);
-        assert!(
-            cache.cache.contains_key(&encoded_gradient4.cache_key),
-            "Gradient4 should be cached"
-        );
+        // Total buffer size should equal sum of surviving widths.
+        let total_width = new_width_a + new_width_c;
+        assert_eq!(cache.luts_size(), (total_width * BYTES_PER_TEXEL) as usize);
     }
 
     #[test]
     fn test_take_and_restore_luts() {
-        let mut cache = GradientRampCache::new(5, Level::baseline());
+        let mut cache = GradientRampCache::new(Level::baseline());
 
-        let gradient1 = create_gradient(0.1);
-        let gradient2 = create_gradient(0.2);
-        let gradient3 = create_gradient(0.3);
-        insert_entry(&mut cache, gradient1.clone());
-        insert_entry(&mut cache, gradient2.clone());
-        insert_entry(&mut cache, gradient3.clone());
-        cache.maintain();
+        insert_entry(&mut cache, create_gradient(0.1));
+        insert_entry(&mut cache, create_gradient(0.2));
         let original_size = cache.luts_size();
-        let original_cache_size = cache.cache.len();
 
         let luts = cache.take_luts();
         assert_eq!(luts.len(), original_size);
-        assert_eq!(cache.luts_size(), 0);
         assert!(cache.is_empty());
 
         cache.restore_luts(luts);
-
         assert_eq!(cache.luts_size(), original_size);
-        assert_eq!(cache.cache.len(), original_cache_size);
         assert!(!cache.is_empty());
-
-        let encoded_gradient1 = create_encoded_gradient(gradient1.clone());
-        let encoded_gradient2 = create_encoded_gradient(gradient2.clone());
-        let encoded_gradient3 = create_encoded_gradient(gradient3.clone());
-        assert!(cache.cache.contains_key(&encoded_gradient1.cache_key));
-        assert!(cache.cache.contains_key(&encoded_gradient2.cache_key));
-        assert!(cache.cache.contains_key(&encoded_gradient3.cache_key));
-    }
-
-    #[test]
-    fn test_lut_start_invalidation() {
-        let mut cache = GradientRampCache::new(2, Level::baseline());
-
-        let gradient_1 = create_encoded_gradient(create_gradient(0.1));
-        let gradient_2 = create_encoded_gradient(create_gradient(0.2));
-        let gradient_3 = create_encoded_gradient(create_gradient(0.3));
-
-        // Frame 1 start
-        let _lut_start_1 = cache.get_or_create_ramp(&gradient_1).0;
-        let _lut_start_2 = cache.get_or_create_ramp(&gradient_2).0;
-        // Frame 1 end
-
-        // Frame 2 start
-        let lut_start_2 = cache.get_or_create_ramp(&gradient_2).0;
-        let lut_start_3 = cache.get_or_create_ramp(&gradient_3).0;
-        // Frame 2 end
-
-        // Gradient lut shouldn't mutate within a frame
-        assert_eq!(
-            lut_start_2,
-            cache.cache.get(&gradient_2.cache_key).unwrap().0.lut_start
-        );
-        assert_eq!(
-            lut_start_3,
-            cache.cache.get(&gradient_3.cache_key).unwrap().0.lut_start
-        );
     }
 }
