@@ -21,27 +21,27 @@ const BYTES_PER_TEXEL: u32 = 4;
 
 /// Packed gradient look-up tables that persist across frames.
 #[derive(Debug)]
-pub(crate) struct GradientRampCache {
+pub struct GradientRampCache {
     /// Cache mapping gradient key to its ramp location and last-used epoch.
     cache: HashMap<CacheKey<GradientCacheKey>, CachedRamp>,
     /// Packed gradient luts.
     luts: Vec<u8>,
     /// Whether the packed luts needs to be re-uploaded.
     has_changed: bool,
-    /// Current frame epoch, incremented each frame in `maintain()`.
-    epoch: u64,
+    /// Current frame, incremented each frame in `maintain()`.
+    frame: u64,
     /// SIMD level used for gradient LUT generation.
     level: Level,
 }
 
 impl GradientRampCache {
     /// Create a new gradient ramp cache.
-    pub(crate) fn new(level: Level) -> Self {
+    pub fn new(level: Level) -> Self {
         Self {
             cache: HashMap::new(),
             luts: Vec::new(),
             has_changed: false,
-            epoch: 0,
+            frame: 0,
             level,
         }
     }
@@ -51,9 +51,9 @@ impl GradientRampCache {
         clippy::cast_possible_truncation,
         reason = "Conversion from usize to u32 is safe, used for texture coordinates"
     )]
-    pub(crate) fn get_or_create_ramp(&mut self, gradient: &EncodedGradient) -> (u32, u32) {
+    pub fn get_or_create_ramp(&mut self, gradient: &EncodedGradient) -> (u32, u32) {
         if let Some(ramp) = self.cache.get_mut(&gradient.cache_key) {
-            ramp.last_used = self.epoch;
+            ramp.last_used = self.frame;
             return (ramp.lut_start, ramp.width);
         }
 
@@ -66,7 +66,7 @@ impl GradientRampCache {
             CachedRamp {
                 lut_start,
                 width,
-                last_used: self.epoch,
+                last_used: self.frame,
             },
         );
         self.has_changed = true;
@@ -78,9 +78,9 @@ impl GradientRampCache {
         clippy::cast_possible_truncation,
         reason = "Conversion from usize to u32 is safe, used for texture coordinates"
     )]
-    pub(crate) fn maintain(&mut self) {
+    pub fn maintain(&mut self) {
         let len_before = self.cache.len();
-        self.cache.retain(|_, r| r.last_used >= self.epoch);
+        self.cache.retain(|_, r| r.last_used >= self.frame);
         if self.cache.len() < len_before {
             // Rebuild the LUT buffer compactly from surviving entries.
             let mut new_luts = Vec::with_capacity(self.luts.len());
@@ -93,36 +93,36 @@ impl GradientRampCache {
             self.luts = new_luts;
             self.has_changed = true;
         }
-        self.epoch += 1;
+        self.frame += 1;
     }
 
     /// Get the size of the packed luts.
-    pub(crate) fn luts_size(&self) -> usize {
+    pub fn luts_size(&self) -> usize {
         self.luts.len()
     }
 
     /// Check if the packed luts is empty.
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.luts.is_empty()
     }
 
     /// Check if the luts data has changed.
-    pub(crate) fn has_changed(&self) -> bool {
+    pub fn has_changed(&self) -> bool {
         self.has_changed
     }
 
     /// Mark the luts as synced.
-    pub(crate) fn mark_synced(&mut self) {
+    pub fn mark_synced(&mut self) {
         self.has_changed = false;
     }
 
     /// Take ownership of the luts, leaving an empty vector in its place.
-    pub(crate) fn take_luts(&mut self) -> Vec<u8> {
+    pub fn take_luts(&mut self) -> Vec<u8> {
         core::mem::take(&mut self.luts)
     }
 
     /// Restore the luts. The restored luts should have the same logical content as the original.
-    pub(crate) fn restore_luts(&mut self, luts: Vec<u8>) {
+    pub fn restore_luts(&mut self, luts: Vec<u8>) {
         self.luts = luts;
     }
 }
@@ -356,7 +356,10 @@ mod tests {
         let mut offsets = [(new_start_a, new_width_a), (new_start_c, new_width_c)];
         offsets.sort_by_key(|(start, _)| *start);
 
-        assert_eq!(offsets[0].0, 0, "First entry should start at 0 after compaction");
+        assert_eq!(
+            offsets[0].0, 0,
+            "First entry should start at 0 after compaction"
+        );
         assert_eq!(
             offsets[1].0,
             offsets[0].0 + offsets[0].1,

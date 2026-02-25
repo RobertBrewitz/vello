@@ -1814,13 +1814,23 @@ dependencies = [
 [[package]]
 name = "kurbo"
 version = "0.13.0"
+dependencies = [
+ "arrayvec",
+ "euclid",
+ "polycool",
+ "schemars",
+ "smallvec",
+]
+
+[[package]]
+name = "kurbo"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7564e90fe3c0d5771e1f0bc95322b21baaeaa0d9213fa6a0b61c99f8b17b3bfb"
 dependencies = [
  "arrayvec",
  "euclid",
  "libm",
- "schemars",
  "smallvec",
 ]
 
@@ -2661,7 +2671,7 @@ checksum = "9a2b6aadb221872732e87d465213e9be5af2849b0e8cc5300a8ba98fffa2e00a"
 dependencies = [
  "bytemuck",
  "color",
- "kurbo 0.13.0",
+ "kurbo 0.13.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "linebender_resource_handle",
  "smallvec",
 ]
@@ -2761,6 +2771,13 @@ name = "pollster"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2f3a9f18d041e6d0e102a0a46750538147e5e8992d3b4873aaafee2520b00ce3"
+
+[[package]]
+name = "polycool"
+version = "0.4.0"
+dependencies = [
+ "arrayvec",
+]
 
 [[package]]
 name = "portable-atomic"
@@ -4059,6 +4076,7 @@ name = "vello_hybrid"
 version = "0.0.6"
 dependencies = [
  "bytemuck",
+ "criterion",
  "guillotiere",
  "hashbrown 0.16.1",
  "js-sys",

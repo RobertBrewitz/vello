@@ -45,7 +45,8 @@
 
 extern crate alloc;
 
-mod gradient_cache;
+#[doc(hidden)]
+pub mod gradient_cache;
 mod render;
 mod scene;
 #[cfg(any(all(target_arch = "wasm32", feature = "webgl"), feature = "wgpu"))]

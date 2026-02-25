@@ -41,6 +41,7 @@ web-sys = { version = "0.3.83", features = [
 ], optional = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
 png = { workspace = true }
 pollster = { workspace = true }
 vello_common = { workspace = true, features = ["pico_svg"] }
@@ -57,6 +58,10 @@ wgpu_default = ["wgpu", "wgpu/default"]
 # Add support for text rendering.
 text = ["vello_common/text"]
 webgl = ["dep:js-sys", "dep:web-sys", "dep:vello_sparse_shaders", "vello_sparse_shaders/glsl"]
+
+[[bench]]
+name = "gradient_cache"
+harness = false
 
 [lints]
 workspace = true
