@@ -1519,7 +1519,7 @@ impl Programs {
                 .expect("Buffer only ever holds `Config`");
             buffer.copy_from_slice(bytemuck::bytes_of(&config));
 
-            self.render_size = new_render_size.clone();
+            self.render_size = *new_render_size;
         }
     }
 

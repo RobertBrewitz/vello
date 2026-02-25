@@ -491,10 +491,13 @@ impl Scheduler {
         self.round = 0;
         #[cfg(debug_assertions)]
         {
-            for i in 0..self.total_slots {
-                debug_assert!(self.free[0].contains(&i), "free[0] is missing slot {i}");
-                debug_assert!(self.free[1].contains(&i), "free[1] is missing slot {i}");
-            }
+            let mut f0 = self.free[0].clone();
+            let mut f1 = self.free[1].clone();
+            f0.sort_unstable();
+            f1.sort_unstable();
+            let expected: Vec<usize> = (0..self.total_slots).collect();
+            debug_assert_eq!(f0, expected, "free[0] slots mismatch");
+            debug_assert_eq!(f1, expected, "free[1] slots mismatch");
         }
         debug_assert!(self.rounds_queue.is_empty(), "rounds_queue is not empty");
 
@@ -1208,14 +1211,14 @@ pub(crate) fn generate_gpu_strips_for_fast_path(
         // the coarse rasterization code is more complex due to clip paths and other factors.
         // It might be possible to reuse some code here, but it seems hard.
 
-        for i in 0..strips.len() - 1 {
-            let strip = &strips[i];
+        for window in strips.windows(2) {
+            let strip = &window[0];
 
             if strip.x >= scene.width {
                 continue;
             }
 
-            let next_strip = &strips[i + 1];
+            let next_strip = &window[1];
             let col = strip.alpha_idx() / u32::from(Tile::HEIGHT);
             let next_col = next_strip.alpha_idx() / u32::from(Tile::HEIGHT);
             let strip_width = next_col.saturating_sub(col) as u16;

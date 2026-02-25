@@ -19,7 +19,7 @@ pub(crate) const GPU_RADIAL_GRADIENT_SIZE_TEXELS: u32 =
 pub(crate) const GPU_SWEEP_GRADIENT_SIZE_TEXELS: u32 = (size_of::<GpuSweepGradient>() / 16) as u32;
 
 /// Dimensions of the rendering target.
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub struct RenderSize {
     /// Width of the rendering target.
     pub width: u32,

@@ -307,8 +307,8 @@ impl Scene {
     /// a `Paint` that references that data. The combined transform (geometry + paint)
     /// is applied during encoding.
     fn encode_current_paint(&mut self) -> Paint {
-        match self.paint.clone() {
-            PaintType::Solid(s) => s.into(),
+        match &self.paint {
+            PaintType::Solid(s) => (*s).into(),
             PaintType::Gradient(g) => g.encode_into(
                 &mut self.encoded_paints,
                 self.transform * self.paint_transform,
@@ -1068,7 +1068,7 @@ impl Scene {
     /// Save current rendering state.
     fn take_current_state(&mut self) -> RenderState {
         RenderState {
-            paint: self.paint.clone(),
+            paint: core::mem::replace(&mut self.paint, PaintType::Solid(BLACK.into())),
             paint_transform: self.paint_transform,
             transform: self.transform,
             fill_rule: self.fill_rule,

@@ -297,7 +297,8 @@ impl WebGlRenderer {
             &mut self.programs.resources.stub_atlas_texture_array,
         );
 
-        let result = self.render_scene(scene, &self.programs.render_size.clone(), false);
+        let render_size = self.programs.render_size;
+        let result = self.render_scene(scene, &render_size, false);
 
         // Restore the real atlas texture array.
         core::mem::swap(
@@ -1057,7 +1058,7 @@ impl WebGlPrograms {
             )
             .unwrap();
 
-            self.render_size = new_render_size.clone();
+            self.render_size = *new_render_size;
         }
     }
 
