@@ -150,6 +150,7 @@ impl TextureBindings {
 /// Vello GPU's renderer.
 #[derive(Debug)]
 pub struct Renderer {
+    hdr: bool,
     /// Programs for rendering.
     programs: Programs,
     /// Encoded paints for storing encoded paints.
@@ -178,6 +179,42 @@ impl Renderer {
         render_target_config: &RenderTargetConfig,
         settings: RenderSettings,
     ) -> (Self, Resources) {
+        Self::new_inner(device, render_target_config, settings, false)
+    }
+
+    /// Creates a linear-sRGB HDR renderer targeting a caller-owned `Rgba16Float` texture.
+    ///
+    /// RGB may exceed one; alpha remains coverage in `[0, 1]`. Output is premultiplied,
+    /// cleared to transparent black, and is not tone-mapped or sRGB-encoded. Applications
+    /// own post-processing and presentation. Solid fills/strokes and gradients support extended
+    /// brightness; other paint types retain their SDR range. Filter layers return
+    /// [`RenderError::UnsupportedHdrScene`]. Blends operate in linear light; non-normal mix modes
+    /// normalize both colors by their shared peak (at least one), then restore that radiance.
+    pub fn new_with_hdr(
+        device: &Device,
+        render_target_config: &RenderTargetConfig,
+        settings: RenderSettings,
+    ) -> Result<(Self, Resources), RenderError> {
+        if render_target_config.format != wgpu::TextureFormat::Rgba16Float
+            || render_target_config.width == 0
+            || render_target_config.height == 0
+        {
+            return Err(RenderError::InvalidHdrTarget);
+        }
+        Ok(Self::new_inner(
+            device,
+            render_target_config,
+            settings,
+            true,
+        ))
+    }
+
+    fn new_inner(
+        device: &Device,
+        render_target_config: &RenderTargetConfig,
+        settings: RenderSettings,
+        hdr: bool,
+    ) -> (Self, Resources) {
         super::common::maybe_warn_about_webgl_feature_conflict();
 
         let mut settings = settings;
@@ -193,16 +230,22 @@ impl Renderer {
         // dimension and the maximum gradient LUT size - worst case scenario.
         let max_gradient_cache_size = resource_texture_dimension_2d * resource_texture_dimension_2d
             / MAX_GRADIENT_LUT_SIZE as u32;
-        let gradient_cache = GradientRampCache::new(max_gradient_cache_size, settings.level);
+        let gradient_cache = if hdr {
+            GradientRampCache::new_hdr(max_gradient_cache_size, settings.level)
+        } else {
+            GradientRampCache::new(max_gradient_cache_size, settings.level)
+        };
         let layer_config = settings.memory_settings.layers_config;
 
         let renderer = Self {
+            hdr,
             programs: Programs::new(
                 device,
                 &resources.image_cache,
                 render_target_config,
                 layer_config,
                 resource_texture_dimension_2d,
+                hdr,
             ),
             gradient_cache,
             encoded_paints: Vec::new(),
@@ -272,6 +315,16 @@ impl Renderer {
         depth_view: Option<&TextureView>,
         texture_bindings: &TextureBindings,
     ) -> Result<(), RenderError> {
+        if self.hdr {
+            crate::validate_hdr_scene(scene)?;
+            if render_size.width == 0
+                || render_size.height == 0
+                || view.texture().format() != wgpu::TextureFormat::Rgba16Float
+                || view.texture().sample_count() != 1
+            {
+                return Err(RenderError::InvalidHdrTarget);
+            }
+        }
         #[cfg(feature = "text")]
         {
             resources.before_render(
@@ -323,6 +376,22 @@ impl Renderer {
             clear_atlas_region(queue, renderer, rect);
         });
         result
+    }
+
+    /// Ends an explicit resource frame and advances glyph eviction once.
+    /// All command buffers using these resources must have been submitted first:
+    /// eviction queues atlas clears that must not precede those draws.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless `resources.begin_frame()` was called.
+    pub fn end_frame(&mut self, resources: &mut Resources, queue: &Queue) {
+        assert!(resources.frame_active, "No resource frame is active");
+        resources.frame_active = false;
+        #[cfg(feature = "text")]
+        resources.after_render(self, |renderer, rect| {
+            clear_atlas_region(queue, renderer, rect);
+        });
     }
 
     /// Render a `scene` directly into an atlas layer.
@@ -448,8 +517,10 @@ impl Renderer {
             .texture_size
             .max(required_texture_size);
         let current_allocations = self.current_allocations();
-        let paint_resolver =
-            PaintResolver::new(encoded_paints, &self.paint_idxs).with_image_cache(image_cache);
+        let linear = self.hdr && root_output_target == RootTarget::UserSurface;
+        let paint_resolver = PaintResolver::new(encoded_paints, &self.paint_idxs)
+            .with_image_cache(image_cache)
+            .with_linear_color(linear);
         let schedule = Schedule::try_new(
             &mut self.schedule_storage,
             scene,
@@ -476,6 +547,19 @@ impl Renderer {
             &self.schedule_storage.filter_context,
         );
 
+        if self.hdr {
+            let linear_color = u32::from(linear);
+            for buffer in [
+                &self.programs.resources.view_config_buffer,
+                &self.programs.resources.layer_config_buffer,
+            ] {
+                queue.write_buffer(
+                    buffer,
+                    core::mem::offset_of!(Config, linear_color) as u64,
+                    bytemuck::bytes_of(&linear_color),
+                );
+            }
+        }
         if clear {
             Self::clear_view(encoder, view);
         }
@@ -921,6 +1005,8 @@ fn clear_atlas_region(queue: &Queue, renderer: &mut Renderer, rect: &PendingClea
 /// Defines the GPU resources and pipelines for rendering.
 #[derive(Debug)]
 struct Programs {
+    intermediate_format: wgpu::TextureFormat,
+    atlas_strip_pipeline: RenderPipeline,
     /// Intermediate strip pipeline.
     intermediate_strip_pipeline: RenderPipeline,
     /// Root alpha-strip pipeline.
@@ -1074,7 +1160,14 @@ impl Programs {
         render_target_config: &RenderTargetConfig,
         layer_config: LayersConfig,
         resource_texture_dimension_2d: u32,
+        hdr: bool,
     ) -> Self {
+        let intermediate_format = if hdr {
+            wgpu::TextureFormat::Rgba16Float
+        } else {
+            wgpu::TextureFormat::Rgba8Unorm
+        };
+        let root_format = render_target_config.format;
         let strip_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("Strip Bind Group Layout"),
@@ -1243,28 +1336,38 @@ impl Programs {
 
         let intermediate_strip_pipeline = create_strip_pipeline(
             "Strip Intermediate Pipeline",
-            wgpu::TextureFormat::Rgba8Unorm,
+            intermediate_format,
             Some(BlendState::PREMULTIPLIED_ALPHA_BLENDING),
             None,
         );
+        let atlas_strip_pipeline = if hdr {
+            create_strip_pipeline(
+                "Strip Atlas Pipeline",
+                wgpu::TextureFormat::Rgba8Unorm,
+                Some(BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                None,
+            )
+        } else {
+            intermediate_strip_pipeline.clone()
+        };
 
         let alpha_strip_pipeline = create_strip_pipeline(
             "Strip Alpha Pipeline",
-            render_target_config.format,
+            root_format,
             Some(BlendState::PREMULTIPLIED_ALPHA_BLENDING),
             None,
         );
 
         let depth_alpha_strip_pipeline = create_strip_pipeline(
             "Strip Depth Alpha Pipeline",
-            render_target_config.format,
+            root_format,
             Some(BlendState::PREMULTIPLIED_ALPHA_BLENDING),
             Some(depth_stencil(false)),
         );
 
         let opaque_strip_pipeline = create_strip_pipeline(
             "Strip Opaque Pipeline",
-            render_target_config.format,
+            root_format,
             None,
             Some(depth_stencil(true)),
         );
@@ -1290,7 +1393,7 @@ impl Programs {
                 module: &clear_shader,
                 entry_point: Some("fs_main"),
                 targets: &[Some(ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    format: intermediate_format,
                     // No blending needed for clearing
                     blend: None,
                     write_mask: ColorWrites::ALL,
@@ -1430,7 +1533,7 @@ impl Programs {
                 module: &filter_shader,
                 entry_point: Some("fs_main"),
                 targets: &[Some(ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    format: intermediate_format,
                     blend: None,
                     write_mask: ColorWrites::ALL,
                 })],
@@ -1558,7 +1661,7 @@ impl Programs {
                         module: shader_module,
                         entry_point: Some("fs_main"),
                         targets: &[Some(ColorTargetState {
-                            format: wgpu::TextureFormat::Rgba8Unorm,
+                            format: intermediate_format,
                             blend: None,
                             write_mask: ColorWrites::ALL,
                         })],
@@ -1664,6 +1767,11 @@ impl Programs {
             device,
             resource_texture_dimension_2d,
             INITIAL_GRADIENT_TEXTURE_HEIGHT,
+            if hdr {
+                wgpu::TextureFormat::Rgba16Float
+            } else {
+                wgpu::TextureFormat::Rgba8Unorm
+            },
         );
         let gradient_bind_group = Self::create_gradient_bind_group(
             device,
@@ -1719,6 +1827,8 @@ impl Programs {
         };
 
         Self {
+            intermediate_format,
+            atlas_strip_pipeline,
             intermediate_strip_pipeline,
             alpha_strip_pipeline,
             depth_alpha_strip_pipeline,
@@ -1764,6 +1874,7 @@ impl Programs {
         device: &Device,
         size: SizeU16,
         label: &'static str,
+        format: wgpu::TextureFormat,
     ) -> TextureView {
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some(label),
@@ -1775,7 +1886,7 @@ impl Programs {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
+            format,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[],
         });
@@ -1811,6 +1922,7 @@ impl Programs {
                         device,
                         texture_size,
                         "Layer Intermediate Texture",
+                        self.intermediate_format,
                     );
                 }
             }
@@ -1820,15 +1932,20 @@ impl Programs {
                     device,
                     texture_size,
                     "Layer Intermediate Texture",
+                    self.intermediate_format,
                 )
             }));
         }
         let scratch_changed = (self.resources.scratch_texture.is_some() && size_changed)
             || (self.resources.scratch_texture.is_none() && scratch_required);
         if scratch_changed {
-            self.resources.scratch_texture = Some(ScratchTexture::new(
-                Self::create_intermediate_texture(device, texture_size, "Scratch Texture"),
-            ));
+            self.resources.scratch_texture =
+                Some(ScratchTexture::new(Self::create_intermediate_texture(
+                    device,
+                    texture_size,
+                    "Scratch Texture",
+                    self.intermediate_format,
+                )));
         }
 
         self.resources.texture_size = texture_size;
@@ -1920,6 +2037,8 @@ impl Programs {
                 strip_offset_x: 0,
                 strip_offset_y: 0,
                 negate_ndc: 0,
+                linear_color: 0,
+                _padding: [0; 3],
             }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         })
@@ -2074,7 +2193,12 @@ impl Programs {
         })
     }
 
-    fn create_gradient_texture(device: &Device, width: u32, height: u32) -> Texture {
+    fn create_gradient_texture(
+        device: &Device,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+    ) -> Texture {
         device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Gradient Texture"),
             size: Extent3d {
@@ -2085,7 +2209,7 @@ impl Programs {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
+            format,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         })
@@ -2288,7 +2412,7 @@ impl Programs {
         resource_texture_dimension_2d: u32,
         gradient_cache: &GradientRampCache,
     ) {
-        let gradient_pixels = (gradient_cache.luts_size() / 4) as u32; // 4 bytes per RGBA8 pixel
+        let gradient_pixels = gradient_cache.luts_size() as u32 / gradient_cache.bytes_per_texel();
         let required_gradient_height = gradient_pixels.div_ceil(resource_texture_dimension_2d);
         debug_assert!(
             self.resources.gradient_texture.width() == resource_texture_dimension_2d,
@@ -2304,6 +2428,7 @@ impl Programs {
                 device,
                 resource_texture_dimension_2d,
                 required_gradient_height,
+                self.resources.gradient_texture.format(),
             );
             self.resources.gradient_texture = gradient_texture;
 
@@ -2336,6 +2461,8 @@ impl Programs {
                 strip_offset_x: 0,
                 strip_offset_y: 0,
                 negate_ndc: 0,
+                linear_color: 0,
+                _padding: [0; 3],
             };
             let mut buffer = queue
                 .write_buffer_with(&self.resources.view_config_buffer, 0, SIZE_OF_CONFIG)
@@ -2482,7 +2609,9 @@ impl Programs {
 
         // Upload the gradient LUT data
         if !gradient_cache.is_empty() {
-            let total_capacity = (gradient_texture_width * gradient_texture_height * 4) as usize;
+            let bytes_per_texel = gradient_cache.bytes_per_texel();
+            let total_capacity =
+                (gradient_texture_width * gradient_texture_height * bytes_per_texel) as usize;
 
             // Take ownership of the luts to avoid copying, then resize for texture padding
             let mut luts = gradient_cache.take_luts();
@@ -2499,8 +2628,7 @@ impl Programs {
                 &luts,
                 wgpu::TexelCopyBufferLayout {
                     offset: 0,
-                    // 4 bytes per RGBA8 pixel
-                    bytes_per_row: Some(gradient_texture_width << 2),
+                    bytes_per_row: Some(gradient_texture_width * bytes_per_texel),
                     rows_per_image: Some(gradient_texture_height),
                 },
                 Extent3d {
@@ -2754,6 +2882,8 @@ impl RendererContext<'_> {
                     &self.programs.alpha_strip_pipeline
                 };
                 render_pass.set_pipeline(pipeline);
+            } else if matches!(target, DrawPassTarget::Root(RootTarget::AtlasLayer)) {
+                render_pass.set_pipeline(&self.programs.atlas_strip_pipeline);
             } else {
                 render_pass.set_pipeline(&self.programs.intermediate_strip_pipeline);
             }

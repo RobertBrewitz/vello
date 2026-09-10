@@ -53,7 +53,14 @@ fn blend_mix_compose(backdrop: vec4<f32>, src: vec4<f32>, compose_mode: u32, mix
     var cs = src.rgb * inv_src_a;
     let inv_backdrop_a = 1.0 / max(backdrop.a, EPSILON);
     let cb = backdrop.rgb * inv_backdrop_a;
-    let mixed = blend_mix(cb, cs, mix_mode);
+    // Non-normal mix formulas assume [0, 1]. A shared peak preserves HDR hue and
+    // radiance without changing SDR inputs or the Porter-Duff coverage factors.
+    var mixed = cs;
+    if mix_mode != MIX_NORMAL {
+        let peak = max(vec3(1.0), max(cb, cs));
+        let scale = max(peak.r, max(peak.g, peak.b));
+        mixed = blend_mix(cb / scale, cs / scale, mix_mode) * scale;
+    }
     cs = mix(cs, mixed, backdrop.a);
 
     if compose_mode == COMPOSE_SRC_OVER {
@@ -253,8 +260,7 @@ fn set_sat(c: vec3<f32>, s: f32) -> vec3<f32> {
     return vec3(r, g, b);
 }
 
-// Blends two RGB colors together. The colors are assumed to be in sRGB
-// color space, and this function does not take alpha into account.
+// Mix formulas operate in the caller's working color space on normalized RGB.
 fn blend_mix(cb: vec3<f32>, cs: vec3<f32>, mode: u32) -> vec3<f32> {
     var b = vec3(0.0);
     switch mode {

@@ -88,6 +88,12 @@ these and other limitations in future releases.
 
 <!-- cargo-rdme end -->
 
+## HDR output
+
+Both backends support opt-in linear HDR rendering into application-owned textures.
+Post-processing and display conversion belong to the application.
+See [HDR output](HDR.md) for setup and current limitations.
+
 ## Minimum supported Rust Version (MSRV)
 
 This version of Vello GPU has been verified to compile with **Rust 1.89** and later.

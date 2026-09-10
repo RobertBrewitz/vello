@@ -191,6 +191,7 @@ impl EncodeExt for Gradient {
             self.interpolation_cs,
             self.hue_direction,
             self.interpolation_alpha_space,
+            false,
         );
 
         // This represents the transform that needs to be applied to the starting point of a
@@ -210,9 +211,10 @@ impl EncodeExt for Gradient {
         let (x_advance, y_advance) = x_y_advances(&transform);
 
         let cache_key = CacheKey(GradientCacheKey {
-            stops: self.stops.clone(),
+            stops: ColorStops(stops.into_owned()),
             interpolation_cs: self.interpolation_cs,
             hue_direction: self.hue_direction,
+            interpolation_alpha_space: self.interpolation_alpha_space,
         });
 
         let has_undefined = kind.has_undefined();
@@ -229,6 +231,7 @@ impl EncodeExt for Gradient {
             may_have_transparency,
             u8_lut: OnceCell::new(),
             f32_lut: OnceCell::new(),
+            hdr_lut: OnceCell::new(),
         };
 
         let idx = paints.len();
@@ -333,6 +336,7 @@ fn encode_stops(
     cs: ColorSpaceTag,
     hue_dir: HueDirection,
     interpolation_alpha_space: InterpolationAlphaSpace,
+    hdr: bool,
 ) -> Vec<GradientRange> {
     #[derive(Debug)]
     struct EncodedColorStop {
@@ -342,11 +346,11 @@ fn encode_stops(
 
     let create_range = |left_stop: &EncodedColorStop, right_stop: &EncodedColorStop| {
         let clamp = |mut color: [f32; 4]| {
-            // The linear approximation of the gradient can produce values slightly outside of
-            // [0.0, 1.0], so clamp them.
-            for c in &mut color {
-                *c = c.clamp(0.0, 1.0);
+            // Approximation may overshoot; HDR RGB must not be limited to coverage.
+            for c in &mut color[..3] {
+                *c = c.clamp(0.0, if hdr { 65504.0 } else { 1.0 });
             }
+            color[3] = color[3].clamp(0.0, 1.0);
 
             color
         };
@@ -773,6 +777,7 @@ pub struct EncodedGradient {
     pub may_have_transparency: bool,
     u8_lut: OnceCell<GradientLut<u8>>,
     f32_lut: OnceCell<GradientLut<f32>>,
+    hdr_lut: OnceCell<GradientLut<f32>>,
 }
 
 impl EncodedGradient {
@@ -789,6 +794,21 @@ impl EncodedGradient {
         self.f32_lut
             .get_or_init(|| GradientLut::new(simd, &self.ranges))
     }
+
+    /// Premultiplied extended-sRGB samples, retaining RGB above coverage for HDR rendering.
+    pub fn hdr_lut<S: Simd>(&self, simd: S) -> &GradientLut<f32> {
+        self.hdr_lut.get_or_init(|| {
+            let key = &self.cache_key.0;
+            let ranges = encode_stops(
+                &key.stops,
+                key.interpolation_cs,
+                key.hue_direction,
+                key.interpolation_alpha_space,
+                true,
+            );
+            simd.vectorize(|| GradientLut::new_inner(simd, &ranges, true))
+        })
+    }
 }
 
 /// Cache key for gradient color ramps based on color-affecting properties.
@@ -800,6 +820,8 @@ pub struct GradientCacheKey {
     pub interpolation_cs: ColorSpaceTag,
     /// Hue direction used for interpolation.
     pub hue_direction: HueDirection,
+    /// Whether interpolation happens before or after premultiplication.
+    pub interpolation_alpha_space: InterpolationAlphaSpace,
 }
 
 impl BitHash for GradientCacheKey {
@@ -807,6 +829,7 @@ impl BitHash for GradientCacheKey {
         self.stops.bit_hash(state);
         core::mem::discriminant(&self.interpolation_cs).hash(state);
         core::mem::discriminant(&self.hue_direction).hash(state);
+        core::mem::discriminant(&self.interpolation_alpha_space).hash(state);
     }
 }
 
@@ -815,6 +838,7 @@ impl BitEq for GradientCacheKey {
         self.stops.bit_eq(&other.stops)
             && self.interpolation_cs == other.interpolation_cs
             && self.hue_direction == other.hue_direction
+            && self.interpolation_alpha_space == other.interpolation_alpha_space
     }
 }
 
@@ -1021,12 +1045,12 @@ impl<T: GradientLutExt> GradientLut<T> {
     fn new<S: Simd>(simd: S, ranges: &[GradientRange]) -> Self {
         simd.vectorize(
             #[inline(always)]
-            || Self::new_inner(simd, ranges),
+            || Self::new_inner(simd, ranges, false),
         )
     }
 
     #[inline(always)]
-    fn new_inner<S: Simd>(simd: S, ranges: &[GradientRange]) -> Self {
+    fn new_inner<S: Simd>(simd: S, ranges: &[GradientRange], hdr: bool) -> Self {
         let lut_size = determine_lut_size(ranges);
         let mut lut = vec![[T::ZERO; 4]; lut_size];
         let lut_flat = bytemuck::cast_slice_mut::<[T; 4], T>(&mut lut);
@@ -1073,11 +1097,20 @@ impl<T: GradientLutExt> GradientLut<T> {
                     };
                 }
 
-                // Due to floating-point impreciseness, it can happen that
-                // values either become greater than 1 or the RGB channels
-                // become greater than the alpha channel. To prevent overflows
-                // in later parts of the pipeline, we need to take the minimum here.
-                result = result.min(1.0).min(alphas);
+                // SDR compositors require RGB <= alpha; HDR constrains coverage independently.
+                if hdr {
+                    let rgb = mask32x16::simd_from(
+                        simd,
+                        [-1, -1, -1, 0, -1, -1, -1, 0, -1, -1, -1, 0, -1, -1, -1, 0],
+                    );
+                    result = simd.select_f32x16(
+                        rgb,
+                        result.max(0.0).min(65504.0),
+                        alphas.max(0.0).min(1.0),
+                    );
+                } else {
+                    result = result.min(1.0).min(alphas);
+                }
                 let rs = T::from_f32x16(result);
 
                 // We always compute 4 samples at a time, but a gradient ramp does not necessarily

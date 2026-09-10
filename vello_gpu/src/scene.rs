@@ -256,6 +256,35 @@ impl Scene {
         }
     }
 
+    /// Whether recording is currently inside an unclosed layer.
+    pub fn has_open_layers(&self) -> bool {
+        self.recorder.has_layers()
+    }
+
+    /// Whether a non-source-over blend targets the scene root. Such blends cannot
+    /// be preserved when this scene is rasterized separately and composited source-over.
+    /// Nest them inside an explicit normal layer to keep their destination local.
+    pub fn root_is_blend_target(&self) -> bool {
+        self.recorder.root_is_blend_target
+    }
+
+    /// Conservative output bounds in viewport pixels, including clips and filters.
+    /// All layers must be closed before querying the completed scene.
+    pub fn content_bounds(&self) -> Option<RectU16> {
+        assert!(
+            !self.has_open_layers(),
+            "Close scene layers before querying bounds"
+        );
+        let viewport = RectU16::new(0, 0, self.width, self.height);
+        // Destination-dependent root blends may change pixels outside their source bounds.
+        let bounds = if self.root_is_blend_target() {
+            viewport
+        } else {
+            self.recorder.content_bounds.intersect(viewport)
+        };
+        (!bounds.is_empty()).then_some(bounds)
+    }
+
     fn active_rect(&self) -> Rect {
         Rect::new(
             0.0,
@@ -746,6 +775,36 @@ impl Scene {
     pub fn set_paint(&mut self, paint: impl Into<PaintType>) {
         self.render_state.paint = paint.into();
         self.set_paint_visible();
+    }
+
+    /// Set a solid sRGB color multiplied by `intensity` in linear light.
+    ///
+    /// An intensity above one enables emission above white when using an HDR renderer.
+    /// Ordinary renderers clamp the result to SDR. Alpha is not multiplied. Emission is
+    /// supported for path/rectangle fills and strokes, not cached glyph tints or blurred
+    /// rounded rectangles.
+    ///
+    /// # Panics
+    ///
+    /// Panics if intensity is negative, non-finite, or greater than 65504, or if the
+    /// color contains non-finite components, negative RGB, or alpha outside `[0, 1]`.
+    pub fn set_emissive_paint(&mut self, color: vello_common::peniko::Color, intensity: f32) {
+        use vello_common::peniko::color::{LinearSrgb, Srgb};
+        assert!(
+            intensity.is_finite() && (0.0..=65504.0).contains(&intensity),
+            "emission intensity must be finite and in [0, 65504]"
+        );
+        assert!(
+            color.components.iter().all(|v| v.is_finite())
+                && color.components[..3].iter().all(|v| *v >= 0.0)
+                && (0.0..=1.0).contains(&color.components[3]),
+            "emission color must have finite nonnegative RGB and alpha in [0, 1]"
+        );
+        let mut linear = color.convert::<LinearSrgb>();
+        for channel in &mut linear.components[..3] {
+            *channel = (*channel * intensity).min(65504.0);
+        }
+        self.set_paint(linear.convert::<Srgb>());
     }
 
     fn set_paint_visible(&mut self) {

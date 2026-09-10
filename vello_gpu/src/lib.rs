@@ -122,6 +122,15 @@ use thiserror::Error;
 /// Errors that can occur during rendering.
 #[derive(Error, Debug, Clone)]
 pub enum RenderError {
+    /// The device cannot render to the floating-point textures required by HDR.
+    #[error("HDR requires renderable RGBA16F textures")]
+    HdrUnsupported,
+    /// HDR currently supports scenes without filter layers.
+    #[error("HDR does not yet support filter layers")]
+    UnsupportedHdrScene,
+    /// HDR requires a nonempty RGBA16F texture rather than an SDR canvas or attachment.
+    #[error("HDR requires a nonempty RGBA16F render target")]
+    InvalidHdrTarget,
     /// An image atlas allocation failed.
     #[error("Atlas allocation failed: {0}")]
     AtlasError(#[from] vello_common::multi_atlas::AtlasError),
@@ -164,6 +173,13 @@ pub enum IntermediateTextureError {
         /// The configured maximum number of intermediate textures.
         max: usize,
     },
+}
+
+pub(crate) fn validate_hdr_scene(scene: &Scene) -> Result<(), RenderError> {
+    if !scene.recorder.filter_layers.is_empty() {
+        return Err(RenderError::UnsupportedHdrScene);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -23,6 +23,7 @@ wgpu = { workspace = true, default-features = false, optional = true }
 vello_gpu_shaders = { workspace = true, optional = true }
 log = { workspace = true }
 hashbrown = { workspace = true }
+half = { version = "2.7", default-features = false }
 
 js-sys = { workspace = true, optional = true }
 web-sys = { workspace = true, features = [

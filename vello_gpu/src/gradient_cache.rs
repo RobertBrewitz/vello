@@ -9,9 +9,7 @@ use vello_common::encode::{EncodedGradient, GradientCacheKey};
 use vello_common::fearless_simd::{Level, Simd, dispatch};
 use vello_common::peniko::color::cache_key::CacheKey;
 
-/// Number of bytes per texel in the gradient texture.
-/// Gradient textures use `Rgba8Unorm` format (4 bytes per texel).
-/// This constant is used to convert between byte offsets and texel indices.
+/// SDR ramps use RGBA8; HDR caches override this with RGBA16F's eight bytes.
 const BYTES_PER_TEXEL: u32 = 4;
 
 #[derive(Debug)]
@@ -28,6 +26,7 @@ pub(crate) struct GradientRampCache {
     retained_count: u32,
     /// SIMD level used for gradient LUT generation.
     level: Level,
+    hdr: bool,
     /// Scratch space for maintaining the cache.
     scratch: ScratchSpace,
 }
@@ -63,8 +62,20 @@ impl GradientRampCache {
             has_changed: false,
             retained_count,
             level,
+            hdr: false,
             scratch: ScratchSpace::default(),
         }
+    }
+
+    pub(crate) fn new_hdr(retained_count: u32, level: Level) -> Self {
+        Self {
+            hdr: true,
+            ..Self::new(retained_count, level)
+        }
+    }
+
+    pub(crate) fn bytes_per_texel(&self) -> u32 {
+        if self.hdr { 8 } else { BYTES_PER_TEXEL }
     }
 
     /// Get or generate a gradient ramp, returning its offset in the packed luts.
@@ -82,9 +93,12 @@ impl GradientRampCache {
         }
 
         // Generate new gradient LUT.
-        let lut_start = self.luts.len() as u32 / BYTES_PER_TEXEL;
-        let width = dispatch!(self.level, simd => generate_gradient_lut_impl(simd, gradient, &mut self.luts))
-            as u32;
+        let lut_start = self.luts.len() as u32 / self.bytes_per_texel();
+        let width = if self.hdr {
+            dispatch!(self.level, simd => generate_hdr_gradient_lut_impl(simd, gradient, &mut self.luts))
+        } else {
+            dispatch!(self.level, simd => generate_gradient_lut_impl(simd, gradient, &mut self.luts))
+        } as u32;
         let cached_ramp = CachedRamp { width, lut_start };
         self.has_changed = true;
         self.cache
@@ -206,8 +220,8 @@ impl GradientRampCache {
         let mut read_pos = 0;
 
         for (_, ramp) in ramps_to_remove.iter() {
-            let remove_start = (ramp.lut_start * BYTES_PER_TEXEL) as usize;
-            let remove_end = remove_start + (ramp.width * BYTES_PER_TEXEL) as usize;
+            let remove_start = (ramp.lut_start * self.bytes_per_texel()) as usize;
+            let remove_end = remove_start + (ramp.width * self.bytes_per_texel()) as usize;
             // First, copy all the LUT entries before the removed entry to the new
             // write position.
             if read_pos < remove_start {
@@ -282,6 +296,21 @@ fn generate_gradient_lut_impl<S: Simd>(
     let bytes: &[u8] = bytemuck::cast_slice(lut.lut());
     output.reserve(bytes.len());
     output.extend_from_slice(bytes);
+    lut.width()
+}
+
+fn generate_hdr_gradient_lut_impl<S: Simd>(
+    simd: S,
+    gradient: &EncodedGradient,
+    output: &mut Vec<u8>,
+) -> usize {
+    let lut = gradient.hdr_lut(simd);
+    output.reserve(lut.width() * 8);
+    for color in lut.lut() {
+        for &channel in color {
+            output.extend_from_slice(&half::f16::from_f32(channel).to_bits().to_le_bytes());
+        }
+    }
     lut.width()
 }
 

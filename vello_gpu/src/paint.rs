@@ -14,6 +14,7 @@ const COLOR_SOURCE_PAYLOAD: u32 = 0;
 pub(crate) const COLOR_SOURCE_LAYER: u32 = 1;
 
 const PAINT_TYPE_SOLID: u32 = 0;
+const PAINT_TYPE_LINEAR_SOLID: u32 = 6;
 const PAINT_TYPE_IMAGE: u32 = 1;
 const PAINT_TYPE_LINEAR_GRADIENT: u32 = 2;
 const PAINT_TYPE_RADIAL_GRADIENT: u32 = 3;
@@ -75,6 +76,7 @@ pub(crate) struct PaintResolver<'a> {
     gpu_offsets: &'a [u32],
     /// Resolves internal images to their atlas textures.
     image_cache: Option<&'a ImageCache>,
+    linear: bool,
 }
 
 impl<'a> PaintResolver<'a> {
@@ -83,6 +85,7 @@ impl<'a> PaintResolver<'a> {
             encoded,
             gpu_offsets,
             image_cache: None,
+            linear: false,
         }
     }
 
@@ -92,9 +95,33 @@ impl<'a> PaintResolver<'a> {
         self
     }
 
+    pub(crate) fn with_linear_color(mut self, linear: bool) -> Self {
+        self.linear = linear;
+        self
+    }
+
     #[inline]
     pub(crate) fn pack(self, paint: &Paint) -> PackedPaint {
         match paint {
+            Paint::Solid(color) if self.linear => {
+                use vello_common::peniko::color::LinearSrgb;
+                let c = color
+                    .as_premul_f32()
+                    .un_premultiply()
+                    .convert::<LinearSrgb>();
+                let a = color.as_premul_rgba8().to_u32() >> 24;
+                let rgb = [c.components[0], c.components[1], c.components[2]].map(|v| {
+                    u32::from(
+                        half::f16::from_f32(v.clamp(0.0, 65504.0) * (a as f32 / 255.0)).to_bits(),
+                    )
+                });
+                PackedPaint {
+                    payload: PaintPayload::Solid(rgb[0] | (rgb[1] << 16)),
+                    paint: (PAINT_TYPE_LINEAR_SOLID << PAINT_TYPE_SHIFT) | rgb[2] | (a << 16),
+                    texture_source: None,
+                    opaque: color.is_opaque(),
+                }
+            }
             Paint::Solid(color) => PackedPaint {
                 payload: PaintPayload::Solid(color.as_premul_rgba8().to_u32()),
                 paint: (COLOR_SOURCE_PAYLOAD << COLOR_SOURCE_SHIFT)

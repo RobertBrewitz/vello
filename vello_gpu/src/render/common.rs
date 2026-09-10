@@ -391,6 +391,10 @@ pub struct Config {
     /// and just apply the second negation manually in case we render to the final output surface
     /// in the WebGL backend.
     pub negate_ndc: u32,
+    /// Whether to evaluate paints in linear sRGB with extended brightness.
+    pub linear_color: u32,
+    /// Reserved uniform-buffer alignment padding.
+    pub _padding: [u32; 3],
 }
 
 /// A GPU strip instance for rendering.

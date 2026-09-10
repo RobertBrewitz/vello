@@ -121,6 +121,8 @@ pub enum WebGlRendererInitStatus {
 /// guaranteed to be restored to their original value after each method call.
 #[derive(Debug)]
 pub struct WebGlRenderer {
+    hdr: bool,
+    output_framebuffer: Option<Framebuffer>,
     /// Programs for rendering.
     pub(super) programs: WebGlPrograms,
     /// WebGL context.
@@ -230,6 +232,39 @@ impl WebGlRenderer {
     ) -> (Self, Resources) {
         let (init, resources) = Self::begin_with(canvas, settings, use_depth_buffer);
         (init.finish(), resources)
+    }
+
+    /// Creates a linear-sRGB HDR renderer for caller-owned RGBA16F textures.
+    ///
+    /// Requires `EXT_color_buffer_float` or `EXT_color_buffer_half_float`. Use
+    /// [`Self::render_to_texture`], not [`Self::render`], to preserve RGB above one.
+    /// Output remains premultiplied and transparent; no tone mapping, bloom, or display
+    /// encoding is performed. Filter layers are rejected. Blends operate in linear light,
+    /// with non-normal mix modes normalized by the shared peak radiance.
+    /// Offscreen rendering does not use a depth buffer.
+    pub fn new_with_hdr(
+        canvas: &HtmlCanvasElement,
+        settings: RenderSettings,
+    ) -> Result<(Self, Resources), RenderError> {
+        let (mut renderer, resources) = Self::new_with(canvas, settings, false);
+        if renderer
+            .gl
+            .get_extension("EXT_color_buffer_float")
+            .ok()
+            .flatten()
+            .is_none()
+            && renderer
+                .gl
+                .get_extension("EXT_color_buffer_half_float")
+                .ok()
+                .flatten()
+                .is_none()
+        {
+            return Err(RenderError::HdrUnsupported);
+        }
+        renderer.hdr = true;
+        renderer.programs.intermediate_format = WebGl2RenderingContext::RGBA16F;
+        Ok((renderer, resources))
     }
 
     /// Begins creating a WebGL2 renderer and its persistent resources.
@@ -414,6 +449,9 @@ impl WebGlRenderer {
         render_size: &RenderSize,
         texture_bindings: &WebGlTextureBindings,
     ) -> Result<(), RenderError> {
+        if self.hdr {
+            return Err(RenderError::InvalidHdrTarget);
+        }
         debug_assert_eq!(
             RenderSize {
                 width: self.gl.drawing_buffer_width() as u32,
@@ -423,6 +461,107 @@ impl WebGlRenderer {
             "Render size must match drawing buffer size"
         );
 
+        self.render_inner(scene, resources, render_size, texture_bindings, None)
+    }
+
+    /// Render into mip level zero of a caller-owned 2D texture.
+    ///
+    /// `render_size` must match the texture dimensions. HDR renderers require RGBA16F;
+    /// SDR renderers accept a color-renderable texture. The texture is cleared to
+    /// transparent black. Offscreen Y orientation matches uploaded image textures;
+    /// applications must account for it when presenting to the canvas.
+    /// The renderer owns only a reusable framebuffer, never the output texture.
+    pub fn render_to_texture(
+        &mut self,
+        scene: &Scene,
+        resources: &mut Resources,
+        render_size: &RenderSize,
+        texture: &WebGlTexture,
+        texture_bindings: &WebGlTextureBindings,
+    ) -> Result<(), RenderError> {
+        if render_size.width == 0
+            || render_size.height == 0
+            || render_size.width > get_max_texture_dimension_2d(&self.gl)
+            || render_size.height > get_max_texture_dimension_2d(&self.gl)
+        {
+            return Err(RenderError::InvalidHdrTarget);
+        }
+        if self.hdr {
+            crate::validate_hdr_scene(scene)?;
+        }
+        let _guard = WebGlStateGuard::with_config(
+            &self.gl,
+            WebGlStateConfig {
+                framebuffer: true,
+                read_framebuffer: true,
+                ..Default::default()
+            },
+        );
+        let framebuffer = self
+            .output_framebuffer
+            .get_or_insert_with(|| Framebuffer::new(&self.gl));
+        self.gl
+            .bind_framebuffer(WebGl2RenderingContext::FRAMEBUFFER, Some(framebuffer));
+        self.gl.framebuffer_texture_2d(
+            WebGl2RenderingContext::FRAMEBUFFER,
+            WebGl2RenderingContext::COLOR_ATTACHMENT0,
+            WebGl2RenderingContext::TEXTURE_2D,
+            Some(texture),
+            0,
+        );
+        let complete = self
+            .gl
+            .check_framebuffer_status(WebGl2RenderingContext::FRAMEBUFFER)
+            == WebGl2RenderingContext::FRAMEBUFFER_COMPLETE;
+        let parameter = |name| {
+            self.gl
+                .get_framebuffer_attachment_parameter(
+                    WebGl2RenderingContext::FRAMEBUFFER,
+                    WebGl2RenderingContext::COLOR_ATTACHMENT0,
+                    name,
+                )
+                .ok()
+                .and_then(|value| value.as_f64())
+        };
+        let valid = complete
+            && (!self.hdr
+                || (parameter(WebGl2RenderingContext::FRAMEBUFFER_ATTACHMENT_COMPONENT_TYPE)
+                    == Some(f64::from(WebGl2RenderingContext::FLOAT))
+                    && parameter(WebGl2RenderingContext::FRAMEBUFFER_ATTACHMENT_RED_SIZE)
+                        == Some(16.0)
+                    && parameter(WebGl2RenderingContext::FRAMEBUFFER_ATTACHMENT_GREEN_SIZE)
+                        == Some(16.0)
+                    && parameter(WebGl2RenderingContext::FRAMEBUFFER_ATTACHMENT_BLUE_SIZE)
+                        == Some(16.0)
+                    && parameter(WebGl2RenderingContext::FRAMEBUFFER_ATTACHMENT_ALPHA_SIZE)
+                        == Some(16.0)));
+        if !valid {
+            self.gl.framebuffer_texture_2d(
+                WebGl2RenderingContext::FRAMEBUFFER,
+                WebGl2RenderingContext::COLOR_ATTACHMENT0,
+                WebGl2RenderingContext::TEXTURE_2D,
+                None,
+                0,
+            );
+            return Err(RenderError::InvalidHdrTarget);
+        }
+        self.render_inner(
+            scene,
+            resources,
+            render_size,
+            texture_bindings,
+            Some(texture),
+        )
+    }
+
+    fn render_inner(
+        &mut self,
+        scene: &Scene,
+        resources: &mut Resources,
+        render_size: &RenderSize,
+        texture_bindings: &WebGlTextureBindings,
+        texture: Option<&WebGlTexture>,
+    ) -> Result<(), RenderError> {
         #[cfg(feature = "text")]
         {
             resources.before_render(
@@ -449,15 +588,36 @@ impl WebGlRenderer {
             );
         }
 
-        self.render_scene(
+        let use_depth_buffer = self.use_depth_buffer;
+        if texture.is_some() {
+            self.use_depth_buffer = false;
+            self.programs.resources.view_framebuffer_override = self.output_framebuffer.take();
+        }
+        let result = self.render_scene(
             scene,
             &resources.image_cache,
             render_size,
             true,
             RootTarget::UserSurface,
             texture_bindings,
-            None,
-        )?;
+            texture,
+        );
+        if texture.is_some() {
+            self.output_framebuffer = self.programs.resources.view_framebuffer_override.take();
+            self.gl.bind_framebuffer(
+                WebGl2RenderingContext::FRAMEBUFFER,
+                self.output_framebuffer.as_deref(),
+            );
+            // Do not retain ownership of application textures through framebuffer attachments.
+            self.gl.framebuffer_texture_2d(
+                WebGl2RenderingContext::FRAMEBUFFER,
+                WebGl2RenderingContext::COLOR_ATTACHMENT0,
+                WebGl2RenderingContext::TEXTURE_2D,
+                None,
+                0,
+            );
+        }
+        self.use_depth_buffer = use_depth_buffer;
 
         #[cfg(feature = "text")]
         {
@@ -468,7 +628,21 @@ impl WebGlRenderer {
             });
         }
 
-        Ok(())
+        result
+    }
+
+    /// Ends an explicit resource frame after all its renders and advances glyph eviction once.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless `resources.begin_frame()` was called.
+    pub fn end_frame(&mut self, resources: &mut Resources) {
+        assert!(resources.frame_active, "No resource frame is active");
+        resources.frame_active = false;
+        #[cfg(feature = "text")]
+        resources.after_render(self, |renderer, rect| {
+            clear_atlas_region(renderer, rect);
+        });
     }
 
     /// Render a `scene` directly into an atlas layer.
@@ -605,8 +779,10 @@ impl WebGlRenderer {
 
         let current_allocations = self.current_allocations();
 
-        let paint_resolver =
-            PaintResolver::new(encoded_paints, &self.paint_idxs).with_image_cache(image_cache);
+        let linear = self.hdr && root_output_target == RootTarget::UserSurface;
+        let paint_resolver = PaintResolver::new(encoded_paints, &self.paint_idxs)
+            .with_image_cache(image_cache)
+            .with_linear_color(linear);
         let schedule = Schedule::try_new(
             &mut self.schedule_storage,
             scene,
@@ -632,6 +808,21 @@ impl WebGlRenderer {
             &self.paint_idxs,
             &self.schedule_storage.filter_context,
         );
+        if self.hdr {
+            for buffer in [
+                &self.programs.resources.view_config_buffer,
+                &self.programs.resources.layer_config_buffer,
+            ] {
+                let linear_color = u32::from(linear);
+                self.gl
+                    .bind_buffer(WebGl2RenderingContext::UNIFORM_BUFFER, Some(buffer));
+                self.gl.buffer_sub_data_with_i32_and_u8_array(
+                    WebGl2RenderingContext::UNIFORM_BUFFER,
+                    core::mem::offset_of!(Config, linear_color) as i32,
+                    bytemuck::bytes_of(&linear_color),
+                );
+            }
+        }
         if clear {
             self.programs.clear_view_framebuffer(&self.gl);
         }
@@ -1032,6 +1223,8 @@ impl WebGlRendererInit {
     /// undesirable.
     pub fn finish(self) -> WebGlRenderer {
         WebGlRenderer {
+            hdr: false,
+            output_framebuffer: None,
             programs: self.programs.finish(&self.gl),
             gl: self.gl,
             encoded_paints: Vec::new(),
@@ -1061,6 +1254,7 @@ fn clear_atlas_region(renderer: &mut WebGlRenderer, rect: &PendingClearRect) {
 /// Contains the WebGL programs and resources for rendering.
 #[derive(Debug)]
 pub(crate) struct WebGlPrograms {
+    intermediate_format: u32,
     /// Program for rendering strips.
     strip_program: Program,
     /// Uniform locations for the strip program
@@ -1414,6 +1608,7 @@ impl PendingWebGlPrograms {
         );
 
         WebGlPrograms {
+            intermediate_format: WebGl2RenderingContext::RGBA8,
             strip_program,
             strip_uniforms,
             filter_program,
@@ -1499,13 +1694,13 @@ impl WebGlPrograms {
             if size_changed {
                 let page_count = textures.len().max(required_page_count);
                 textures.clear();
-                textures
-                    .extend((0..page_count).map(|_| create_intermediate_texture(gl, texture_size)));
+                textures.extend((0..page_count).map(|_| {
+                    create_intermediate_texture(gl, texture_size, self.intermediate_format)
+                }));
             } else {
-                textures.extend(
-                    (textures.len()..required_page_count)
-                        .map(|_| create_intermediate_texture(gl, texture_size)),
-                );
+                textures.extend((textures.len()..required_page_count).map(|_| {
+                    create_intermediate_texture(gl, texture_size, self.intermediate_format)
+                }));
             }
         }
 
@@ -1517,7 +1712,7 @@ impl WebGlPrograms {
             let _ = self.resources.scratch_texture.take();
 
             self.resources.scratch_texture = Some(ScratchTexture::new(
-                create_intermediate_texture(gl, texture_size),
+                create_intermediate_texture(gl, texture_size, self.intermediate_format),
             ));
         }
 
@@ -1746,6 +1941,8 @@ impl WebGlPrograms {
                 strip_offset_x: 0,
                 strip_offset_y: 0,
                 negate_ndc: u32::from(negate_ndc),
+                linear_color: 0,
+                _padding: [0; 3],
             };
 
             gl.bind_buffer(
@@ -2334,6 +2531,8 @@ fn upload_layer_config_buffer(
         strip_offset_y: 0,
         // Always use y-down when rendering to layer textures.
         negate_ndc: 0,
+        linear_color: 0,
+        _padding: [0; 3],
     };
     gl.bind_buffer(WebGl2RenderingContext::UNIFORM_BUFFER, Some(buffer));
     gl.buffer_data_with_u8_array(
@@ -2457,10 +2656,11 @@ fn create_webgl_resources(
 fn create_intermediate_texture(
     gl: &WebGl2RenderingContext,
     size: SizeU16,
+    format: u32,
 ) -> WebGlIntermediateTexture {
     let texture = create_texture_storage(
         gl,
-        WebGl2RenderingContext::RGBA8,
+        format,
         u32::from(size.width()),
         u32::from(size.height()),
         WebGl2RenderingContext::LINEAR,

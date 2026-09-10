@@ -143,5 +143,6 @@ fn fs_main(
 
     let composed = blend_mix_compose(backdrop, child, compose, mix_mode);
 
-    return mix(backdrop, composed, clip_coverage);
+    let color = mix(backdrop, composed, clip_coverage);
+    return vec4(clamp(color.rgb, vec3(0.0), vec3(65504.0)), clamp(color.a, 0.0, 1.0));
 }

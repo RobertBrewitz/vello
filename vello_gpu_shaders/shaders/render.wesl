@@ -24,6 +24,7 @@
 // More details in the `StripInstance` documentation below.
 
 import package::helpers::alpha::unpack_alphas_from_channel;
+import package::helpers::linear_color::linearize_premul;
 import package::helpers::blurred_rounded_rect::calculate_blurred_rounded_rect;
 import package::helpers::extend::extend_mode;
 import package::helpers::external_texture::sample_external_image;
@@ -64,6 +65,8 @@ const PAINT_TYPE_LINEAR_GRADIENT: u32 = 2u;
 const PAINT_TYPE_RADIAL_GRADIENT: u32 = 3u;
 const PAINT_TYPE_SWEEP_GRADIENT: u32 = 4u;
 const PAINT_TYPE_BLURRED_ROUNDED_RECT: u32 = 5u;
+// Linear premultiplied half-float RG in payload; half-float B and unorm8 alpha in bits 0..24.
+const PAINT_TYPE_LINEAR_SOLID: u32 = 6u;
 
 // 24 bits for paint indices.
 const PAINT_TEXTURE_INDEX_MASK: u32 = 0x00FFFFFFu;
@@ -94,8 +97,11 @@ struct Config {
     // within the atlas where the filter layer will be rendered to.
     strip_offset_x: i32,
     strip_offset_y: i32,
-    // Whether to flip the y-component of the NDC coordinates.
     ndc_y_negate: u32,
+    linear_color: u32,
+    padding0: u32,
+    padding1: u32,
+    padding2: u32,
 }
 
 // A `StripInstance` can represent either a **normal strip** (representing a sparse fill or alpha fill of height
@@ -122,6 +128,7 @@ struct Config {
 //       - Bits 26-28: `paint_type` (0 = solid, 1 = image, 2 = linear_gradient, 3 = radial_gradient, 4 = sweep_gradient)
 //       - Bits 0-25:
 //         - If paint_type = 0: unused
+//         - If paint_type = 6: half-float B in bits 0-15, unorm8 alpha in bits 16-23
 //         - Bits 0-23: `paint_texture_idx` for every non-solid paint
 //         - Bits 24-25: external texture slot for external images; unused otherwise
 //
@@ -143,9 +150,12 @@ struct Config {
 // ├── paint_type = 4 (PAINT_TYPE_SWEEP_GRADIENT) - Sweep gradient rendering
 //     ├── payload = [x, y] scene coordinates (packed as u16s)
 //     └── bits 0-23 = paint_texture_idx
-// └── paint_type = 5 (PAINT_TYPE_BLURRED_ROUNDED_RECT) - Analytic blurred rounded rectangle
+// ├── paint_type = 5 (PAINT_TYPE_BLURRED_ROUNDED_RECT) - Analytic blurred rounded rectangle
 //     ├── payload = [x, y] scene coordinates (packed as u16s)
 //     └── bits 0-23 = paint_texture_idx
+//
+// └── paint_type = 6 (PAINT_TYPE_LINEAR_SOLID) - Linear premultiplied emissive solid
+//     └── payload = half-float R in bits 0-15, half-float G in bits 16-31
 //
 // color_source = 1 (COLOR_SOURCE_LAYER) - Use rendered layer texture
 // ├── payload = [x, y] source layer texture origin (packed as u16s)
@@ -391,6 +401,12 @@ fn fs_main(
         // in.payload encodes a color for PAINT_TYPE_SOLID or sample_xy for PAINT_TYPE_IMAGE
         if paint_type == PAINT_TYPE_SOLID {
             final_color = alpha * unpack4x8unorm(payload);
+        } else if paint_type == PAINT_TYPE_LINEAR_SOLID {
+            let r = decode_positive_half(payload & 0xffffu);
+            let g = decode_positive_half(payload >> 16u);
+            let b = decode_positive_half(paint_and_rect_flag & 0xffffu);
+            let a = f32((paint_and_rect_flag >> 16u) & 0xffu) / 255.0;
+            final_color = alpha * vec4(r, g, b, a);
         } else if paint_type == PAINT_TYPE_IMAGE {
             let paint_tex_idx = paint_and_rect_flag & PAINT_TEXTURE_INDEX_MASK;
             let image_texel0 = load_encoded_paint_texel(paint_tex_idx, 0u);
@@ -560,7 +576,21 @@ fn fs_main(
         final_color = vec4<f32>(0.0);
     }
 
+    if config.linear_color != 0u && color_source == COLOR_SOURCE_PAYLOAD
+        && ((paint_and_rect_flag >> 26u) & 0x7u) != PAINT_TYPE_LINEAR_SOLID {
+        final_color = linearize_premul(final_color);
+        // Half-float sRGB ramps can round just above the maximum linear radiance.
+        final_color = vec4(min(final_color.rgb, vec3(65504.0)), final_color.a);
+    }
     return final_color;
+}
+
+// Avoid requiring native half-float shader capabilities on downlevel backends.
+fn decode_positive_half(bits: u32) -> f32 {
+    if (bits & 0x7c00u) == 0u {
+        return f32(bits & 0x3ffu) * (1.0 / 16777216.0);
+    }
+    return bitcast<f32>((bits << 13u) + 0x38000000u);
 }
 
 // Convert a flat texel index to 2D texture coordinates for the encoded paints texture.
