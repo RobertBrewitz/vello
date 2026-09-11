@@ -60,6 +60,13 @@ The renderer is split into several key components:
 
 See the individual module documentation for more details on usage and implementation.
 
+## Layer filters
+
+Blur, drop shadow, fill and tint support HDR. Tint uses an engine-specific sRGB
+mapping with HDR radiance scaling, not exact lottie-web parity. Directional and
+non-transparent-edge blur are experimental and use costly direct convolution;
+cropped paint bounds are not suitable for Lottie edge sampling.
+
 ## Current state
 
 Vello GPU is a solid GPU-accelerated 2D renderer with broad, reliable

@@ -12,6 +12,7 @@ pub(crate) mod context;
 mod drop_shadow;
 mod flood;
 mod gaussian_blur;
+mod layer_effects;
 mod offset;
 mod shift;
 
@@ -67,6 +68,11 @@ pub(crate) fn filter_lowp(
     let prepared_filter = PreparedFilter::new(filter, &transform);
 
     match prepared_filter {
+        effect @ (PreparedFilter::GaussianBlurAxes { .. }
+        | PreparedFilter::Fill { .. }
+        | PreparedFilter::Tint { .. }) => {
+            layer_effects::apply(&effect, pixmap);
+        }
         PreparedFilter::Flood(flood) => {
             flood.execute_lowp(pixmap, filter_scratch);
         }
@@ -105,6 +111,11 @@ pub(crate) fn filter_highp(
     let prepared_filter = PreparedFilter::new(filter, &transform);
 
     match prepared_filter {
+        effect @ (PreparedFilter::GaussianBlurAxes { .. }
+        | PreparedFilter::Fill { .. }
+        | PreparedFilter::Tint { .. }) => {
+            layer_effects::apply(&effect, pixmap);
+        }
         PreparedFilter::Flood(flood) => {
             flood.execute_highp(pixmap, filter_scratch);
         }

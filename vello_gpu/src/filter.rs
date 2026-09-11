@@ -31,7 +31,8 @@ pub(crate) const FILTER_ATLAS_PADDING: u16 = MAX_KERNEL_SIZE as u16 / 2;
 
 // Since we store in RGBA32 texture.
 const BYTES_PER_TEXEL: usize = 16;
-const FILTER_SIZE_BYTES: usize = 48;
+const FILTER_SIZE_BYTES: usize = 64;
+const LINEAR_COLOR_MASK: u32 = 1 << 14;
 const FILTER_SIZE_U32: usize = FILTER_SIZE_BYTES / 4;
 const COMPOSITE_ORIGINAL_SHIFT: u32 = 13;
 const COMPOSITE_ORIGINAL_MASK: u32 = 1 << COMPOSITE_ORIGINAL_SHIFT;
@@ -62,6 +63,9 @@ pub(crate) mod filter_type {
     pub(crate) const FLOOD: u32 = 1;
     pub(crate) const GAUSSIAN_BLUR: u32 = 2;
     pub(crate) const DROP_SHADOW: u32 = 3;
+    pub(crate) const BLUR_AXES: u32 = 4;
+    pub(crate) const FILL: u32 = 5;
+    pub(crate) const TINT: u32 = 6;
 }
 
 pub(crate) mod edge_mode {
@@ -81,6 +85,9 @@ pub(crate) mod pass_kind {
     pub(crate) const UPSCALE: u32 = 6;
     pub(crate) const COMPOSITE_DROP_SHADOW: u32 = 7;
     pub(crate) const COLORIZE: u32 = 8;
+    pub(crate) const BLUR_AXIS_X: u32 = 9;
+    pub(crate) const BLUR_AXIS_Y: u32 = 10;
+    pub(crate) const MAP_COLOR: u32 = 11;
 }
 
 pub(crate) fn edge_mode_to_gpu(mode: EdgeMode) -> u32 {
@@ -197,7 +204,7 @@ pub(crate) struct GpuOffset {
     pub header: u32,
     pub dx: f32,
     pub dy: f32,
-    pub _padding: [u32; 9],
+    pub _padding: [u32; 13],
 }
 
 impl From<&Offset> for GpuOffset {
@@ -206,7 +213,7 @@ impl From<&Offset> for GpuOffset {
             header: pack_header(filter_type::OFFSET),
             dx: offset.dx,
             dy: offset.dy,
-            _padding: [0; 9],
+            _padding: [0; 13],
         }
     }
 }
@@ -216,7 +223,7 @@ impl From<&Offset> for GpuOffset {
 pub(crate) struct GpuFlood {
     pub header: u32,
     pub color: u32,
-    pub _padding: [u32; 10],
+    pub _padding: [u32; 14],
 }
 
 impl From<&Flood> for GpuFlood {
@@ -224,7 +231,7 @@ impl From<&Flood> for GpuFlood {
         Self {
             header: pack_header(filter_type::FLOOD),
             color: flood.color.premultiply().to_rgba8().to_u32(),
-            _padding: [0; 10],
+            _padding: [0; 14],
         }
     }
 }
@@ -237,7 +244,7 @@ pub(crate) struct GpuGaussianBlur {
     pub linear_weights: [f32; MAX_TAPS_PER_SIDE],
     pub linear_offsets: [f32; MAX_TAPS_PER_SIDE],
     // Needed since drop shadow has a bigger footprint.
-    pub _padding: [u32; 4],
+    pub _padding: [u32; 8],
 }
 
 impl From<&GaussianBlur> for GpuGaussianBlur {
@@ -261,7 +268,7 @@ impl From<&GaussianBlur> for GpuGaussianBlur {
             center_weight: lk.center_weight,
             linear_weights: lk.weights,
             linear_offsets: lk.offsets,
-            _padding: [0; 4],
+            _padding: [0; 8],
         }
     }
 }
@@ -275,8 +282,8 @@ pub(crate) struct GpuDropShadow {
     pub linear_offsets: [f32; MAX_TAPS_PER_SIDE],
     pub dx: f32,
     pub dy: f32,
-    pub color: u32,
-    pub _padding: [u32; 1],
+    pub color: [f32; 4],
+    pub _padding: [u32; 2],
 }
 
 impl From<&DropShadow> for GpuDropShadow {
@@ -304,8 +311,8 @@ impl From<&DropShadow> for GpuDropShadow {
             linear_offsets: lk.offsets,
             dx: shadow.dx,
             dy: shadow.dy,
-            color: shadow.color.premultiply().to_rgba8().to_u32(),
-            _padding: [0; 1],
+            color: shadow.color.components,
+            _padding: [0; 2],
         }
     }
 }
@@ -359,6 +366,40 @@ impl<T: CastToFilterData> From<T> for GpuFilterData {
 impl From<&PreparedFilter> for GpuFilterData {
     fn from(filter: &PreparedFilter) -> Self {
         match filter {
+            PreparedFilter::GaussianBlurAxes { axes, edge_mode } => {
+                let mut data = GpuFilterData::zeroed();
+                data.data[0] =
+                    pack_header(filter_type::BLUR_AXES) | (edge_mode_to_gpu(*edge_mode) << 5);
+                for (i, axis) in axes.iter().enumerate() {
+                    data.data[1 + i * 2] = (axis.x as f32).to_bits();
+                    data.data[2 + i * 2] = (axis.y as f32).to_bits();
+                }
+                data
+            }
+            PreparedFilter::Fill { color } => {
+                let mut data = GpuFilterData::zeroed();
+                data.data[0] = pack_header(filter_type::FILL);
+                for (target, component) in data.data[1..5].iter_mut().zip(color.components) {
+                    *target = component.to_bits();
+                }
+                data
+            }
+            PreparedFilter::Tint {
+                black,
+                white,
+                amount,
+            } => {
+                let mut data = GpuFilterData::zeroed();
+                data.data[0] = pack_header(filter_type::TINT);
+                for (target, component) in data.data[1..5].iter_mut().zip(black.components) {
+                    *target = component.to_bits();
+                }
+                for (target, component) in data.data[5..9].iter_mut().zip(white.components) {
+                    *target = component.to_bits();
+                }
+                data.data[9] = amount.to_bits();
+                data
+            }
             PreparedFilter::Offset(f) => GpuOffset::from(f).into(),
             PreparedFilter::Flood(f) => GpuFlood::from(f).into(),
             PreparedFilter::GaussianBlur(f) => GpuGaussianBlur::from(f).into(),
@@ -444,6 +485,11 @@ impl FilterPassPlan {
                 filter_type::GAUSSIAN_BLUR => {
                     builder.emit_blur_sequence(filter.gpu_filter.n_decimations());
                 }
+                filter_type::BLUR_AXES => {
+                    builder.emit(pass_kind::BLUR_AXIS_X);
+                    builder.emit(pass_kind::BLUR_AXIS_Y);
+                }
+                filter_type::FILL | filter_type::TINT => builder.emit(pass_kind::MAP_COLOR),
                 filter_type::DROP_SHADOW => {
                     builder.emit(pass_kind::OFFSET);
                     builder.emit_blur_sequence(filter.gpu_filter.n_decimations());
@@ -618,14 +664,29 @@ impl<'a> FilterPassBuilder<'a> {
 }
 
 impl FilterContext {
+    pub(crate) fn set_linear_color(&mut self, linear: bool) {
+        for filter in &mut self.filters {
+            filter.data[0] =
+                (filter.data[0] & !LINEAR_COLOR_MASK) | if linear { LINEAR_COLOR_MASK } else { 0 };
+        }
+    }
+
     pub(crate) fn clear(&mut self) {
         self.filters.clear();
     }
 
-    pub(crate) fn push(&mut self, filter_data: &FilterData) -> PreparedGpuFilter {
+    pub(crate) fn push(
+        &mut self,
+        filter_data: &FilterData,
+        source_bounds: RectU16,
+    ) -> PreparedGpuFilter {
         let data_offset = self.total_texels();
         let prepared = PreparedFilter::new(&filter_data.filter, &filter_data.transform);
-        let data = GpuFilterData::from(&prepared);
+        let mut data = GpuFilterData::from(&prepared);
+        if data.filter_type() == filter_type::BLUR_AXES {
+            data.data[5] = pack_u16_pair(source_bounds.x0, source_bounds.y0);
+            data.data[6] = pack_u16_pair(source_bounds.width(), source_bounds.height());
+        }
         self.filters.push(data);
 
         PreparedGpuFilter { data_offset, data }

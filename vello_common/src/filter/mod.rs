@@ -26,6 +26,18 @@ pub mod offset;
 /// A filter that has been prepared for rendering.
 #[derive(Debug)]
 pub enum PreparedFilter {
+    GaussianBlurAxes {
+        axes: [Vec2; 2],
+        edge_mode: crate::filter_effects::EdgeMode,
+    },
+    Fill {
+        color: crate::color::AlphaColor<crate::color::Srgb>,
+    },
+    Tint {
+        black: crate::color::AlphaColor<crate::color::Srgb>,
+        white: crate::color::AlphaColor<crate::color::Srgb>,
+        amount: f32,
+    },
     /// A flood filter.
     Flood(Flood),
     /// A gaussian blur filter.
@@ -45,6 +57,29 @@ impl PreparedFilter {
         }
 
         match &filter.graph.primitives[0] {
+            FilterPrimitive::Fill { color } => Self::Fill { color: *color },
+            FilterPrimitive::Tint {
+                black,
+                white,
+                amount,
+            } => Self::Tint {
+                black: *black,
+                white: *white,
+                amount: amount.clamp(0.0, 1.0),
+            },
+            FilterPrimitive::GaussianBlurAxes {
+                std_deviation,
+                edge_mode,
+            } => {
+                let [a, b, c, d, _, _] = transform.as_coeffs();
+                Self::GaussianBlurAxes {
+                    axes: [
+                        Vec2::new(a, b) * std_deviation.x.max(0.0),
+                        Vec2::new(c, d) * std_deviation.y.max(0.0),
+                    ],
+                    edge_mode: *edge_mode,
+                }
+            }
             FilterPrimitive::Flood { color } => {
                 let flood = Flood::new(*color);
                 Self::Flood(flood)
@@ -54,6 +89,15 @@ impl PreparedFilter {
                 edge_mode,
             } => {
                 let scaled_std_dev = transform_blur_params(*std_deviation, transform);
+                if *edge_mode != crate::filter_effects::EdgeMode::None {
+                    return Self::GaussianBlurAxes {
+                        axes: [
+                            Vec2::new(f64::from(scaled_std_dev), 0.0),
+                            Vec2::new(0.0, f64::from(scaled_std_dev)),
+                        ],
+                        edge_mode: *edge_mode,
+                    };
+                }
                 let blur = GaussianBlur::new(scaled_std_dev, *edge_mode);
                 Self::GaussianBlur(blur)
             }
@@ -108,6 +152,8 @@ impl PreparedFilter {
 /// Metadata about a filter layer and how it should be composited back into the parent layer.
 #[derive(Debug, Clone, Copy)]
 pub struct FilterLayerPlacement {
+    /// Unfiltered content bounds relative to the padded pixmap, for edge sampling.
+    pub source_bounds: RectU16,
     /// The conceptual bounding box of the pixmap that needs to be allocated to render
     /// a layer correctly, including the area affected by the filter.
     ///
@@ -133,6 +179,7 @@ pub struct FilterLayerPlacement {
 
 impl FilterLayerPlacement {
     pub(crate) const EMPTY: Self = Self {
+        source_bounds: RectU16::ZERO,
         pixmap_bbox: RectU16::ZERO,
         dest_bbox: RectU16::ZERO,
         src_x: 0,
@@ -171,6 +218,7 @@ impl FilterLayerPlacement {
         let dest_bbox = pixmap_bbox.relative_to_origin((shift_x, shift_y));
 
         Self {
+            source_bounds: bbox.relative_to_origin((pixmap_bbox.x0, pixmap_bbox.y0)),
             pixmap_bbox,
             dest_bbox,
             src_x,

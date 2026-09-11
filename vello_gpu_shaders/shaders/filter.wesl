@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
 import package::filters::blur::{BLUR_HORIZONTAL, BLUR_VERTICAL, gaussian_blur};
+import package::filters::blur_axes::blur_axis;
+import package::filters::color_map::{filter_color, tint_color};
 import package::filters::drop_shadow::{
     colorize_drop_shadow,
     composite_drop_shadow,
@@ -24,7 +26,7 @@ import package::helpers::util::unpack_u16_pair;
 
 // Keep these variables and layouts in sync with the ones in `filter.rs`!
 
-const FILTER_SIZE_BYTES: u32 = 48;
+const FILTER_SIZE_BYTES: u32 = 64;
 const FILTER_SIZE_U32: u32 = FILTER_SIZE_BYTES / 4;
 const TEXELS_PER_FILTER: u32 = FILTER_SIZE_U32 / 4u;
 
@@ -42,17 +44,21 @@ const PASS_BLUR_V: u32 = 5u;
 const PASS_UPSCALE: u32 = 6u;
 const PASS_COMPOSITE_DROP_SHADOW: u32 = 7u;
 const PASS_COLORIZE: u32 = 8u;
+const PASS_BLUR_AXIS_X: u32 = 9u;
+const PASS_BLUR_AXIS_Y: u32 = 10u;
+const PASS_MAP_COLOR: u32 = 11u;
 
 // Keep in sync with FILTER_ATLAS_PADDING in vello_gpu/src/filter.rs.
 const FILTER_ATLAS_PADDING: u32 = 6u;
 
 // The layout of the header:
 //   bits [0:4]   = filter_type   (5 bits)
-//   bits [5:6]   = edge_mode     (2 bits, only for blur filters), currently ignored.
+//   bits [5:6]   = edge_mode     (2 bits, direct blur filters)
 //   bits [7:10]  = n_decimations (4 bits, only for blur filters), only read on the CPU side.
 //   bits [11:12] = n_linear_taps (2 bits, only for blur filters)
 //   bit  [13]    = composite_original (only for drop shadows), only read on the CPU side.
-//   bits [14:32] = reserved for future use
+//   bit  [14]    = linear HDR color
+//   bits [15:32] = reserved for future use
 
 fn load_filter_texel(texel_offset: u32, texel_index: u32) -> vec4<u32> {
     let w = textureDimensions(filter_data).x;
@@ -250,24 +256,60 @@ fn fs_main(
                 dest_origin,
             );
         }
+        case PASS_BLUR_AXIS_X, PASS_BLUR_AXIS_Y: {
+            let t0 = load_filter_texel(filter_data_offset, 0u);
+            let t1 = load_filter_texel(filter_data_offset, 1u);
+            let x = vec2<f32>(bitcast<f32>(t0.y), bitcast<f32>(t0.z));
+            let y = vec2<f32>(bitcast<f32>(t0.w), bitcast<f32>(t1.x));
+            let edge_mode = (t0.x >> 5u) & 3u;
+            // Wrap's period is the source content, not the larger padded intermediate.
+            if filter_pass_kind == PASS_BLUR_AXIS_X || edge_mode == 1u {
+                let bounds_origin = unpack_u16_pair(t1.y);
+                let bounds_size = unpack_u16_pair(t1.z);
+                if any(bounds_size == vec2<u32>(0u)) { return vec4<f32>(0.0); }
+                return blur_axis(source_texture, source_origin + bounds_origin, bounds_size,
+                                 rel_coord - vec2<f32>(bounds_origin),
+                                 select(x, y, filter_pass_kind == PASS_BLUR_AXIS_Y), edge_mode);
+            }
+            return blur_axis(source_texture, source_origin, source_size, rel_coord, y, edge_mode);
+        }
+        case PASS_MAP_COLOR: {
+            let t0 = load_filter_texel(filter_data_offset, 0u);
+            let t1 = load_filter_texel(filter_data_offset, 1u);
+            let t2 = load_filter_texel(filter_data_offset, 2u);
+            let linear = (t0.x & (1u << 14u)) != 0u;
+            let source = sample_source(source_origin, rel_coord);
+            let first = bitcast<vec4<f32>>(vec4<u32>(t0.yzw, t1.x));
+            if get_filter_type(t0) == 5u { return filter_color(first, linear) * source.a; }
+            let second = bitcast<vec4<f32>>(vec4<u32>(t1.yzw, t2.x));
+            return tint_color(source, first.rgb, second.rgb, bitcast<f32>(t2.y), linear);
+        }
         case PASS_COMPOSITE_DROP_SHADOW: {
+            let t0 = load_filter_texel(filter_data_offset, 0u);
             let filter_texel2 = load_filter_texel(filter_data_offset, 2u);
+            let t3 = load_filter_texel(filter_data_offset, 3u);
+            let color = filter_color(bitcast<vec4<f32>>(vec4<u32>(filter_texel2.zw, t3.xy)),
+                                     (t0.x & (1u << 14u)) != 0u);
             return composite_drop_shadow(
                 source_texture,
                 original_texture,
                 source_origin,
                 original_origin,
                 rel_coord,
-                filter_texel2,
+                color,
             );
         }
         case PASS_COLORIZE: {
+            let t0 = load_filter_texel(filter_data_offset, 0u);
             let filter_texel2 = load_filter_texel(filter_data_offset, 2u);
+            let t3 = load_filter_texel(filter_data_offset, 3u);
+            let color = filter_color(bitcast<vec4<f32>>(vec4<u32>(filter_texel2.zw, t3.xy)),
+                                     (t0.x & (1u << 14u)) != 0u);
             return colorize_drop_shadow(
                 source_texture,
                 source_origin,
                 rel_coord,
-                filter_texel2,
+                color,
             );
         }
         // Shouldn't be reached.

@@ -3,8 +3,7 @@
 
 //! Gaussian blur filter passes.
 
-// TODO: Add support for edge modes when blurring. This makes it harder or impossible to use
-// bilinear sampling because image padding is always transparent, so only add it when needed.
+// This fast path relies on transparent atlas padding; other edge modes use blur_axes.
 
 const BLUR_HORIZONTAL: vec2<f32> = vec2<f32>(1.0, 0.0);
 const BLUR_VERTICAL: vec2<f32> = vec2<f32>(0.0, 1.0);

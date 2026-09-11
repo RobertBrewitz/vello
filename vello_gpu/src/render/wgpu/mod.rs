@@ -187,8 +187,8 @@ impl Renderer {
     /// RGB may exceed one; alpha remains coverage in `[0, 1]`. Output is premultiplied,
     /// cleared to transparent black, and is not tone-mapped or sRGB-encoded. Applications
     /// own post-processing and presentation. Solid fills/strokes and gradients support extended
-    /// brightness; other paint types retain their SDR range. Filter layers return
-    /// [`RenderError::UnsupportedHdrScene`]. Blends operate in linear light; non-normal mix modes
+    /// brightness; other paint types retain their SDR range. Blur, shadow, fill and tint filters
+    /// support HDR; other filters return [`RenderError::UnsupportedHdrScene`]. Non-normal mix modes
     /// normalize both colors by their shared peak (at least one), then restore that radiance.
     pub fn new_with_hdr(
         device: &Device,
@@ -531,6 +531,9 @@ impl Renderer {
             current_allocations,
             self.layers_config.max_textures,
         )?;
+        self.schedule_storage
+            .filter_context
+            .set_linear_color(linear);
         self.programs
             .prepare_intermediate_textures(device, &schedule);
         // TODO: For the time being, we upload the entire alpha buffer as one big chunk. As a future

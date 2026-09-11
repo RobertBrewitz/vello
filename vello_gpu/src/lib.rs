@@ -125,8 +125,8 @@ pub enum RenderError {
     /// The device cannot render to the floating-point textures required by HDR.
     #[error("HDR requires renderable RGBA16F textures")]
     HdrUnsupported,
-    /// HDR currently supports scenes without filter layers.
-    #[error("HDR does not yet support filter layers")]
+    /// The scene contains a filter without HDR color handling.
+    #[error("HDR supports blur, drop shadow, fill and tint filters only")]
     UnsupportedHdrScene,
     /// HDR requires a nonempty RGBA16F texture rather than an SDR canvas or attachment.
     #[error("HDR requires a nonempty RGBA16F render target")]
@@ -176,8 +176,26 @@ pub enum IntermediateTextureError {
 }
 
 pub(crate) fn validate_hdr_scene(scene: &Scene) -> Result<(), RenderError> {
-    if !scene.recorder.filter_layers.is_empty() {
-        return Err(RenderError::UnsupportedHdrScene);
+    use vello_common::filter_effects::FilterPrimitive;
+    use vello_common::record::RecordedLayerKind;
+
+    for &id in &scene.recorder.filter_layers {
+        let RecordedLayerKind::Filter { filter_data, .. } =
+            &scene.recorder.layers[id as usize].kind
+        else {
+            return Err(RenderError::UnsupportedHdrScene);
+        };
+        if !matches!(
+            filter_data.filter.graph.primitives.as_slice(),
+            [FilterPrimitive::GaussianBlur { .. }
+                | FilterPrimitive::GaussianBlurAxes { .. }
+                | FilterPrimitive::DropShadow { .. }
+                | FilterPrimitive::DropShadowOnly { .. }
+                | FilterPrimitive::Fill { .. }
+                | FilterPrimitive::Tint { .. }]
+        ) {
+            return Err(RenderError::UnsupportedHdrScene);
+        }
     }
     Ok(())
 }

@@ -793,6 +793,9 @@ impl WebGlRenderer {
             current_allocations,
             self.layers_config.max_textures,
         )?;
+        self.schedule_storage
+            .filter_context
+            .set_linear_color(linear);
         self.programs
             .prepare_intermediate_textures(&self.gl, &schedule, required_texture_size);
 

@@ -18,7 +18,8 @@
 //!
 //! **Filter Primitives (Single Use Only):**
 //! - `Flood` - Solid color fill
-//! - `GaussianBlur` - Gaussian blur filter
+//! - `GaussianBlur`, `GaussianBlurAxes` - Gaussian blur, including independent axes
+//! - `Fill`, `Tint` - Source-alpha-preserving color effects
 //! - `DropShadow` - Drop shadow effect (compound primitive)
 //! - `DropShadowOnly` - Drop shadow effect without the original input
 //! - `Offset` - Translation/shift (single primitive)
@@ -362,6 +363,19 @@ pub enum EdgeMode {
 /// See: <https://drafts.fxtf.org/filter-effects/#FilterPrimitivesOverview>
 #[derive(Debug, Clone, PartialEq)]
 pub enum FilterPrimitive {
+    /// Gaussian blur with independent standard deviations in layer coordinates.
+    GaussianBlurAxes {
+        std_deviation: Vec2,
+        edge_mode: EdgeMode,
+    },
+    /// Recolor source coverage without filling transparent pixels.
+    Fill { color: AlphaColor<Srgb> },
+    /// Map sRGB luminance between two colors, then mix with the source.
+    Tint {
+        black: AlphaColor<Srgb>,
+        white: AlphaColor<Srgb>,
+        amount: f32,
+    },
     /// Generate a solid color fill.
     ///
     /// Creates a rectangle filled with the specified color, typically used as
@@ -577,6 +591,11 @@ impl FilterPrimitive {
     /// The filter expansion of the primitive, see [`Filter::filter_expansion`].
     pub fn filter_expansion(&self) -> Rect {
         match self {
+            Self::GaussianBlurAxes { std_deviation, .. } => {
+                let x = std_deviation.x.max(0.0) * 3.0;
+                let y = std_deviation.y.max(0.0) * 3.0;
+                Rect::new(-x, -y, x, y)
+            }
             Self::GaussianBlur { std_deviation, .. } => {
                 let radius = blur_radius(*std_deviation);
                 Rect::new(-radius, -radius, radius, radius)
