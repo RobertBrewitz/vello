@@ -96,16 +96,21 @@ impl Resources {
         mut render_to_atlas: impl FnMut(&mut T, &Scene, u32, AtlasConfig, AtlasId),
         mut upload_to_atlas: impl FnMut(&mut T, &ImageCache, &PendingBitmapUpload, u16, u16),
     ) {
+        self.cache_diagnostics.render_calls += 1;
+        let mut raster_passes = 0;
         let atlas_count = self.atlas_count();
         let atlas_config = self.atlas_config();
         self.replay_pending_atlas_commands(|glyph_renderer, atlas_id| {
+            raster_passes += 1;
             render_to_atlas(backend, glyph_renderer, atlas_count, atlas_config, atlas_id);
         });
+        self.cache_diagnostics.atlas_raster_passes += raster_passes;
 
         const PADDING: u16 = GLYPH_PADDING;
 
         if let Some(glyph_resources) = self.glyph_resources.as_mut() {
             for upload in glyph_resources.glyph_atlas.drain_pending_uploads() {
+                self.cache_diagnostics.bitmap_uploads += 1;
                 let resource = self.image_cache.get(upload.image_id).unwrap();
                 let dst_x = resource.offset[0] + PADDING;
                 let dst_y = resource.offset[1] + PADDING;
@@ -122,10 +127,18 @@ impl Resources {
         if self.frame_active {
             return;
         }
+        self.cache_diagnostics.maintenance_calls += 1;
+        let outlines = self.glyph_prep_cache.outline_count();
         self.glyph_prep_cache.maintain();
+        self.cache_diagnostics.outline_evictions +=
+            outlines.saturating_sub(self.glyph_prep_cache.outline_count()) as u64;
         if let Some(glyph_resources) = self.glyph_resources.as_mut() {
+            let glyphs = glyph_resources.glyph_atlas.len();
             glyph_resources.maintain(&mut self.image_cache);
+            self.cache_diagnostics.glyph_evictions +=
+                glyphs.saturating_sub(glyph_resources.glyph_atlas.len()) as u64;
             for rect in glyph_resources.glyph_atlas.drain_pending_clear_rects() {
+                self.cache_diagnostics.atlas_clear_rects += 1;
                 clear_rect(backend, &rect);
             }
         }

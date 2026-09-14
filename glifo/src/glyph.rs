@@ -239,6 +239,11 @@ pub struct GlyphPrepCache {
 }
 
 impl GlyphPrepCache {
+    /// Number of retained outline paths, excluding hinting instances.
+    pub fn outline_count(&self) -> usize {
+        self.outline_cache.cached_count
+    }
+
     /// Borrow this cache bundle mutable for glyph run construction.
     pub fn as_mut(&mut self) -> GlyphPrepCacheMut<'_> {
         GlyphPrepCacheMut {

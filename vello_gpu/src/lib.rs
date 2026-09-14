@@ -107,6 +107,8 @@ pub use render::{Config, GpuStrip, RenderSize};
 pub use render::{PROBE_ELEMENTS, Probe, ProbeFeature, ProbeResult, ProbeStatistics};
 #[cfg(all(feature = "webgl", feature = "probe"))]
 pub use render::{WebGlPendingProbe, WebGlProbeError, WebGlProbeStatus};
+#[cfg(feature = "text")]
+pub use resources::CacheDiagnostics;
 pub use resources::Resources;
 pub use scene::{LayersConfig, MemorySettings, RenderSettings, Scene};
 #[cfg(feature = "text")]

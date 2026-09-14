@@ -50,6 +50,7 @@ pub struct ImageCache {
     slots: Vec<Option<ImageResource>>,
     /// Stack of free indices.
     free_idxs: Vec<usize>,
+    allocation_failures: u64,
 }
 
 impl core::fmt::Debug for ImageCache {
@@ -72,6 +73,7 @@ impl ImageCache {
             atlas_manager: MultiAtlasManager::new(config),
             slots: Vec::new(),
             free_idxs: Vec::new(),
+            allocation_failures: 0,
         }
     }
 
@@ -109,6 +111,7 @@ impl ImageCache {
         let (Ok(padded_width), Ok(padded_height)) =
             (u16::try_from(padded_width), u16::try_from(padded_height))
         else {
+            self.allocation_failures += 1;
             return Err(AtlasError::TextureTooLarge {
                 width: padded_width,
                 height: padded_height,
@@ -118,7 +121,8 @@ impl ImageCache {
         };
         let atlas_alloc = self
             .atlas_manager
-            .try_allocate(padded_width, padded_height)?;
+            .try_allocate(padded_width, padded_height)
+            .inspect_err(|_| self.allocation_failures += 1)?;
 
         let slot_idx = self.free_idxs.pop().unwrap_or_else(|| {
             // No free slots, append to vector
@@ -170,6 +174,11 @@ impl ImageCache {
     /// Get access to the atlas manager.
     pub fn atlas_manager(&self) -> &MultiAtlasManager {
         &self.atlas_manager
+    }
+
+    /// Failed image or glyph allocations since this cache was created.
+    pub fn allocation_failures(&self) -> u64 {
+        self.allocation_failures
     }
 
     /// Get the number of atlases.
