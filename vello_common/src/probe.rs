@@ -8,7 +8,7 @@ use crate::color::{AlphaColor, palette::css};
 use crate::filter_effects::{EdgeMode, Filter, FilterPrimitive};
 #[cfg(not(feature = "std"))]
 use crate::kurbo::common::FloatFuncs as _;
-use crate::kurbo::{Affine, BezPath, Circle, Point, Rect, Shape};
+use crate::kurbo::{Affine, BezPath, Circle, Point, Rect, Shape, Vec2};
 use crate::paint::{Image, ImageSource, PaintType};
 use crate::peniko::{
     BlendMode, ColorStop, ColorStops, Compose, Extend, Gradient, ImageAlphaType, ImageQuality,
@@ -462,7 +462,7 @@ fn draw_transformed_rect(ctx: &mut impl ProbeRenderer, rect: Rect) {
 #[allow(dead_code, reason = "Will be re-enabled in the future.")]
 fn draw_blurred_rect(ctx: &mut impl ProbeRenderer, rect: Rect) {
     let blur = Filter::from_primitive(FilterPrimitive::GaussianBlur {
-        std_deviation: 0.5,
+        std_deviation: Vec2::new(0.5, 0.5),
         edge_mode: EdgeMode::None,
     });
     ctx.push_filter_layer(blur);

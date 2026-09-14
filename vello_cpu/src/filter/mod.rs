@@ -76,6 +76,20 @@ pub(crate) fn filter_lowp(
         PreparedFilter::Flood(flood) => {
             flood.execute_lowp(pixmap, filter_scratch);
         }
+        PreparedFilter::GaussianBlur(blur)
+            if blur.edge_mode != vello_common::filter_effects::EdgeMode::None =>
+        {
+            layer_effects::apply(
+                &PreparedFilter::GaussianBlurAxes {
+                    axes: [
+                        vello_common::kurbo::Vec2::new(f64::from(blur.std_deviation), 0.0),
+                        vello_common::kurbo::Vec2::new(0.0, f64::from(blur.std_deviation)),
+                    ],
+                    edge_mode: blur.edge_mode,
+                },
+                pixmap,
+            );
+        }
         PreparedFilter::GaussianBlur(blur) => {
             blur.execute_lowp(pixmap, filter_scratch);
         }
@@ -118,6 +132,20 @@ pub(crate) fn filter_highp(
         }
         PreparedFilter::Flood(flood) => {
             flood.execute_highp(pixmap, filter_scratch);
+        }
+        PreparedFilter::GaussianBlur(blur)
+            if blur.edge_mode != vello_common::filter_effects::EdgeMode::None =>
+        {
+            layer_effects::apply(
+                &PreparedFilter::GaussianBlurAxes {
+                    axes: [
+                        vello_common::kurbo::Vec2::new(f64::from(blur.std_deviation), 0.0),
+                        vello_common::kurbo::Vec2::new(0.0, f64::from(blur.std_deviation)),
+                    ],
+                    edge_mode: blur.edge_mode,
+                },
+                pixmap,
+            );
         }
         PreparedFilter::GaussianBlur(blur) => {
             blur.execute_highp(pixmap, filter_scratch);

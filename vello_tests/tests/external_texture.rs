@@ -8,7 +8,7 @@ mod tests {
     use vello_common::color::{AlphaColor, Srgb};
     use vello_common::filter_effects::{EdgeMode, Filter, FilterPrimitive};
     use vello_common::geometry::RectU16;
-    use vello_common::kurbo::{Affine, Circle, Rect, Shape};
+    use vello_common::kurbo::{Affine, Circle, Rect, Shape, Vec2};
     use vello_common::paint::{Image, ImageSource, Tint, TintMode};
     use vello_common::peniko::{Color, Extend, ImageAlphaType, ImageQuality, ImageSampler};
     use vello_common::pixmap::{PixelMetadata, Pixmap};
@@ -419,7 +419,7 @@ mod tests {
     fn external_texture_blurred(ctx: &mut impl Renderer) {
         let texture_id = ctx.register_external_texture(load_image!("glyphs_colr_noto"));
         let blur = Filter::from_primitive(FilterPrimitive::GaussianBlur {
-            std_deviation: 4.0,
+            std_deviation: Vec2::new(4.0, 4.0),
             edge_mode: EdgeMode::None,
         });
 

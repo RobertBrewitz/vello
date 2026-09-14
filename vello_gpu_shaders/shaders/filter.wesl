@@ -262,11 +262,20 @@ fn fs_main(
             let x = vec2<f32>(bitcast<f32>(t0.y), bitcast<f32>(t0.z));
             let y = vec2<f32>(bitcast<f32>(t0.w), bitcast<f32>(t1.x));
             let edge_mode = (t0.x >> 5u) & 3u;
+            let bounds_origin = unpack_u16_pair(t1.y);
+            let bounds_size = unpack_u16_pair(t1.z);
+            if any(bounds_size == vec2<u32>(0u)) { return vec4<f32>(0.0); }
+            // Tile padding must not become visible through duplicate or wrap sampling.
+            if filter_pass_kind == PASS_BLUR_AXIS_Y {
+                let expansion = ceil(3.0 * (abs(x) + abs(y)));
+                let lower = vec2<f32>(bounds_origin) - expansion;
+                let upper = vec2<f32>(bounds_origin + bounds_size) + expansion;
+                if any(rel_coord < lower) || any(rel_coord >= upper) {
+                    return vec4<f32>(0.0);
+                }
+            }
             // Wrap's period is the source content, not the larger padded intermediate.
             if filter_pass_kind == PASS_BLUR_AXIS_X || edge_mode == 1u {
-                let bounds_origin = unpack_u16_pair(t1.y);
-                let bounds_size = unpack_u16_pair(t1.z);
-                if any(bounds_size == vec2<u32>(0u)) { return vec4<f32>(0.0); }
                 return blur_axis(source_texture, source_origin + bounds_origin, bounds_size,
                                  rel_coord - vec2<f32>(bounds_origin),
                                  select(x, y, filter_pass_kind == PASS_BLUR_AXIS_Y), edge_mode);

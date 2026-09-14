@@ -9,10 +9,12 @@
 
 use crate::filter::drop_shadow::{DropShadow, transform_shadow_params};
 use crate::filter::flood::Flood;
-use crate::filter::gaussian_blur::{GaussianBlur, transform_blur_params};
+use crate::filter::gaussian_blur::GaussianBlur;
 use crate::filter::offset::Offset;
 use crate::filter_effects::{Filter, FilterPrimitive};
 use crate::geometry::{PaddingU16, RectU16};
+#[cfg(not(feature = "std"))]
+use crate::kurbo::common::FloatFuncs as _;
 use crate::kurbo::{Affine, Rect, Vec2};
 use crate::math::snap_up;
 use crate::tile::Tile;
@@ -26,8 +28,11 @@ pub mod offset;
 /// A filter that has been prepared for rendering.
 #[derive(Debug)]
 pub enum PreparedFilter {
+    /// Blur axes in device pixels, including their standard deviations.
     GaussianBlurAxes {
+        /// Transformed layer X and Y blur vectors.
         axes: [Vec2; 2],
+        /// Sampling outside the unfiltered content bounds.
         edge_mode: crate::filter_effects::EdgeMode,
     },
     Fill {
@@ -67,19 +72,6 @@ impl PreparedFilter {
                 white: *white,
                 amount: amount.clamp(0.0, 1.0),
             },
-            FilterPrimitive::GaussianBlurAxes {
-                std_deviation,
-                edge_mode,
-            } => {
-                let [a, b, c, d, _, _] = transform.as_coeffs();
-                Self::GaussianBlurAxes {
-                    axes: [
-                        Vec2::new(a, b) * std_deviation.x.max(0.0),
-                        Vec2::new(c, d) * std_deviation.y.max(0.0),
-                    ],
-                    edge_mode: *edge_mode,
-                }
-            }
             FilterPrimitive::Flood { color } => {
                 let flood = Flood::new(*color);
                 Self::Flood(flood)
@@ -88,18 +80,24 @@ impl PreparedFilter {
                 std_deviation,
                 edge_mode,
             } => {
-                let scaled_std_dev = transform_blur_params(*std_deviation, transform);
-                if *edge_mode != crate::filter_effects::EdgeMode::None {
-                    return Self::GaussianBlurAxes {
-                        axes: [
-                            Vec2::new(f64::from(scaled_std_dev), 0.0),
-                            Vec2::new(0.0, f64::from(scaled_std_dev)),
-                        ],
+                let [a, b, c, d, _, _] = transform.as_coeffs();
+                let axes = [
+                    Vec2::new(a, b) * std_deviation.x.max(0.0),
+                    Vec2::new(c, d) * std_deviation.y.max(0.0),
+                ];
+                let xx = axes[0].x * axes[0].x + axes[1].x * axes[1].x;
+                let yy = axes[0].y * axes[0].y + axes[1].y * axes[1].y;
+                let xy = axes[0].x * axes[0].y + axes[1].x * axes[1].y;
+                let tolerance = xx.max(yy) * 1e-12;
+                // A circular device-space kernel can use the optimized uniform blur path.
+                if (xx - yy).abs() <= tolerance && xy.abs() <= tolerance {
+                    Self::GaussianBlur(GaussianBlur::new(xx.sqrt() as f32, *edge_mode))
+                } else {
+                    Self::GaussianBlurAxes {
+                        axes,
                         edge_mode: *edge_mode,
-                    };
+                    }
                 }
-                let blur = GaussianBlur::new(scaled_std_dev, *edge_mode);
-                Self::GaussianBlur(blur)
             }
             FilterPrimitive::DropShadow {
                 dx,

@@ -402,6 +402,15 @@ impl From<&PreparedFilter> for GpuFilterData {
             }
             PreparedFilter::Offset(f) => GpuOffset::from(f).into(),
             PreparedFilter::Flood(f) => GpuFlood::from(f).into(),
+            PreparedFilter::GaussianBlur(f) if f.edge_mode != EdgeMode::None => {
+                Self::from(&PreparedFilter::GaussianBlurAxes {
+                    axes: [
+                        vello_common::kurbo::Vec2::new(f64::from(f.std_deviation), 0.0),
+                        vello_common::kurbo::Vec2::new(0.0, f64::from(f.std_deviation)),
+                    ],
+                    edge_mode: f.edge_mode,
+                })
+            }
             PreparedFilter::GaussianBlur(f) => GpuGaussianBlur::from(f).into(),
             PreparedFilter::DropShadow(f) => GpuDropShadow::from(f).into(),
         }

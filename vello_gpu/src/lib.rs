@@ -188,7 +188,6 @@ pub(crate) fn validate_hdr_scene(scene: &Scene) -> Result<(), RenderError> {
         if !matches!(
             filter_data.filter.graph.primitives.as_slice(),
             [FilterPrimitive::GaussianBlur { .. }
-                | FilterPrimitive::GaussianBlurAxes { .. }
                 | FilterPrimitive::DropShadow { .. }
                 | FilterPrimitive::DropShadowOnly { .. }
                 | FilterPrimitive::Fill { .. }
