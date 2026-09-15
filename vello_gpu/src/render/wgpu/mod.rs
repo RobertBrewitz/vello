@@ -51,7 +51,7 @@ use crate::{
         RootTarget, TextureParity,
     },
 };
-use alloc::vec::Vec;
+use alloc::{collections::VecDeque, vec::Vec};
 use alloc::{sync::Arc, vec};
 use core::{fmt::Debug, num::NonZeroU64};
 use diagnostics::{
@@ -1208,6 +1208,8 @@ struct Programs {
     /// Scratch buffer for staging filter data texture data.
     filter_data: Vec<u8>,
     texture_upload_scratch: Vec<u8>,
+    image_bind_groups: HashMap<[TextureView; EXTERNAL_TEXTURE_SLOT_COUNT], BindGroup>,
+    image_bind_group_order: VecDeque<[TextureView; EXTERNAL_TEXTURE_SLOT_COUNT]>,
 }
 
 /// Contains all GPU resources needed for rendering
@@ -1990,6 +1992,8 @@ impl Programs {
             encoded_paints_data: Vec::new(),
             filter_data: Vec::new(),
             texture_upload_scratch: Vec::new(),
+            image_bind_groups: HashMap::new(),
+            image_bind_group_order: VecDeque::new(),
             render_size: RenderSize {
                 width: render_target_config.width,
                 height: render_target_config.height,
@@ -2699,16 +2703,32 @@ impl Programs {
         }
     }
 
-    fn create_run_external_texture_bind_group(
-        &self,
+    fn cached_external_texture_bind_group(
+        &mut self,
         device: &Device,
-        texture_views: [&TextureView; EXTERNAL_TEXTURE_SLOT_COUNT],
+        texture_views: [TextureView; EXTERNAL_TEXTURE_SLOT_COUNT],
     ) -> BindGroup {
-        Self::create_external_texture_bind_group(
+        const MAX_CACHED_BIND_GROUPS: usize = 256;
+
+        // TextureId bindings can be replaced between renders; view identity is the
+        // cache key, including for internal atlas pages.
+        if let Some(bind_group) = self.image_bind_groups.get(&texture_views) {
+            return bind_group.clone();
+        }
+        let bind_group = Self::create_external_texture_bind_group(
             device,
             &self.external_texture_bind_group_layout,
-            texture_views,
-        )
+            texture_views.each_ref(),
+        );
+        self.diagnostics.bind_groups(BindGroupKind::Image, 1);
+        if self.image_bind_groups.len() == MAX_CACHED_BIND_GROUPS {
+            let oldest = self.image_bind_group_order.pop_front().unwrap();
+            self.image_bind_groups.remove(&oldest);
+        }
+        self.image_bind_group_order.push_back(texture_views.clone());
+        self.image_bind_groups
+            .insert(texture_views, bind_group.clone());
+        bind_group
     }
 
     /// Upload alpha data to the texture.
@@ -2902,12 +2922,9 @@ impl RendererContext<'_> {
                         .clone(),
                     None => placeholder.clone(),
                 });
-                self.programs
-                    .diagnostics
-                    .bind_groups(BindGroupKind::Image, 1);
                 let bind_group = self
                     .programs
-                    .create_run_external_texture_bind_group(self.device, texture_views.each_ref());
+                    .cached_external_texture_bind_group(self.device, texture_views);
                 entry.insert(bind_group)
             }
         }
