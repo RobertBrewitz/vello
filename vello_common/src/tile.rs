@@ -420,6 +420,9 @@ impl PartialOrd for Tile {
 
 impl Eq for Tile {}
 
+#[cfg(feature = "std")]
+mod profile;
+
 /// Handles the tiling of paths.
 #[derive(Clone, Debug)]
 pub struct Tiles {
@@ -476,9 +479,24 @@ impl Tiles {
 
     /// Sort the tiles in the container.
     pub fn sort_tiles(&mut self) {
+        #[cfg(feature = "std")]
+        let measurement = log::log_enabled!(target: "vello_tiles", log::Level::Debug).then(|| {
+            let order = profile::input_order(&self.tile_buf);
+            (order, std::time::Instant::now())
+        });
         self.sorted = true;
-        // To enable auto-vectorization.
-        dispatch!(self.level, _ => self.tile_buf.sort_unstable());
+        // The measured animation paths have long ascending runs; keep small sorts allocation-free.
+        if (1024..=16384).contains(&self.tile_buf.len()) {
+            dispatch!(self.level, _ => self.tile_buf.sort());
+        } else {
+            // To enable auto-vectorization.
+            dispatch!(self.level, _ => self.tile_buf.sort_unstable());
+        }
+        #[cfg(feature = "std")]
+        if let Some((order, start)) = measurement {
+            let elapsed = start.elapsed();
+            profile::record(&self.tile_buf, order, elapsed);
+        }
     }
 
     /// Get the tile at a certain index.
