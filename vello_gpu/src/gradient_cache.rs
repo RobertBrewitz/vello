@@ -116,6 +116,11 @@ impl GradientRampCache {
         self.evict(entries_to_remove_count);
     }
 
+    #[cfg(feature = "wgpu")]
+    pub(crate) fn luts(&self) -> &[u8] {
+        &self.luts
+    }
+
     /// Get the size of the packed luts.
     pub(crate) fn luts_size(&self) -> usize {
         self.luts.len()

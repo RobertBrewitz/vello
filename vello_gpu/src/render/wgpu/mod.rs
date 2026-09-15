@@ -655,7 +655,7 @@ impl Renderer {
             queue,
             &mut self.gradient_cache,
             &self.encoded_paints,
-            &mut scene.strip_storage.borrow_mut().alphas,
+            &scene.strip_storage.borrow().alphas,
             render_size,
             &self.paint_idxs,
             &self.schedule_storage.filter_context,
@@ -1209,6 +1209,7 @@ struct Programs {
     encoded_paints_data: Vec<u8>,
     /// Scratch buffer for staging filter data texture data.
     filter_data: Vec<u8>,
+    texture_upload_scratch: Vec<u8>,
 }
 
 /// Contains all GPU resources needed for rendering
@@ -1896,11 +1897,6 @@ impl Programs {
         );
 
         const INITIAL_ENCODED_PAINTS_TEXTURE_HEIGHT: u32 = 1;
-        let encoded_paints_data = vec![
-            0;
-            ((resource_texture_dimension_2d * INITIAL_ENCODED_PAINTS_TEXTURE_HEIGHT) << 4)
-                as usize
-        ];
         let encoded_paints_texture = Self::create_encoded_paints_texture(
             device,
             resource_texture_dimension_2d,
@@ -1931,11 +1927,6 @@ impl Programs {
 
         // TODO: We really should deduplicate handling of this this with encoded paints texture.
         const INITIAL_FILTER_TEXTURE_HEIGHT: u32 = 1;
-        let filter_data = vec![
-            0_u8;
-            ((resource_texture_dimension_2d * INITIAL_FILTER_TEXTURE_HEIGHT) << 4)
-                as usize
-        ];
         let filter_data_texture = Self::create_filter_data_texture(
             device,
             resource_texture_dimension_2d,
@@ -1994,8 +1985,9 @@ impl Programs {
             blend_pipeline,
             copy_pipeline,
             resources,
-            encoded_paints_data,
-            filter_data,
+            encoded_paints_data: Vec::new(),
+            filter_data: Vec::new(),
+            texture_upload_scratch: Vec::new(),
             render_size: RenderSize {
                 width: render_target_config.width,
                 height: render_target_config.height,
@@ -2441,7 +2433,7 @@ impl Programs {
         queue: &Queue,
         gradient_cache: &mut GradientRampCache,
         encoded_paints: &[GpuEncodedPaint],
-        alphas: &mut Vec<u8>,
+        alphas: &[u8],
         new_render_size: &RenderSize,
         paint_idxs: &[u32],
         filter_context: &FilterContext,
@@ -2453,7 +2445,7 @@ impl Programs {
         self.maybe_update_config_buffer(queue, resource_texture_dimension_2d, new_render_size);
 
         self.upload_alpha_texture(queue, alphas);
-        self.upload_encoded_paints_texture(queue, encoded_paints);
+        self.upload_encoded_paints_texture(queue, encoded_paints, *paint_idxs.last().unwrap());
         self.upload_filter_texture(queue, filter_context);
 
         if gradient_cache.has_changed() {
@@ -2500,10 +2492,6 @@ impl Programs {
         );
         let current_filter_height = self.resources.filter_data_texture.height();
         if required_filter_height > current_filter_height {
-            let required_filter_size =
-                (resource_texture_dimension_2d * required_filter_height) << 4;
-            self.filter_data.resize(required_filter_size as usize, 0);
-
             let filter_texture = Self::create_filter_data_texture(
                 device,
                 resource_texture_dimension_2d,
@@ -2577,10 +2565,6 @@ impl Programs {
                 required_encoded_paints_height <= resource_texture_dimension_2d,
                 "Encoded paints texture height exceeds resource texture dimensions"
             );
-            let required_encoded_paints_size =
-                (resource_texture_dimension_2d * required_encoded_paints_height) << 4;
-            self.encoded_paints_data
-                .resize(required_encoded_paints_size as usize, 0);
             let encoded_paints_texture = Self::create_encoded_paints_texture(
                 device,
                 resource_texture_dimension_2d,
@@ -2700,78 +2684,37 @@ impl Programs {
     }
 
     /// Upload alpha data to the texture.
-    fn upload_alpha_texture(&mut self, queue: &Queue, alphas: &mut Vec<u8>) {
-        if alphas.is_empty() {
-            return;
-        }
-
-        let texture_width = self.resources.alphas_texture.width();
-        let texture_height = self.resources.alphas_texture.height();
-        let total_size = texture_width as usize * texture_height as usize * 16;
-
-        let original_len = alphas.len();
-
-        // Temporarily pad the length of the alphas to the texture size before uploading.
-        alphas.resize(total_size, 0);
-        self.diagnostics
-            .upload(UploadKind::Alpha, total_size as u64);
-
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &self.resources.alphas_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
+    fn upload_alpha_texture(&mut self, queue: &Queue, alphas: &[u8]) {
+        upload_data_texture(
+            queue,
+            &self.resources.alphas_texture,
             alphas,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                // 16 bytes per RGBA32Uint texel (4 u32s × 4 bytes each), which is equivalent to
-                // a bit shift of 4.
-                bytes_per_row: Some(texture_width << 4),
-                rows_per_image: Some(texture_height),
-            },
-            Extent3d {
-                width: texture_width,
-                height: texture_height,
-                depth_or_array_layers: 1,
-            },
+            &mut self.texture_upload_scratch,
+            &mut self.diagnostics,
+            UploadKind::Alpha,
         );
-
-        // Truncate back to the original size.
-        alphas.truncate(original_len);
     }
 
     /// Upload encoded paints to the texture.
-    fn upload_encoded_paints_texture(&mut self, queue: &Queue, encoded_paints: &[GpuEncodedPaint]) {
-        let encoded_paints_texture = &self.resources.encoded_paints_texture;
-        let encoded_paints_texture_width = encoded_paints_texture.width();
-        let encoded_paints_texture_height = encoded_paints_texture.height();
-
+    fn upload_encoded_paints_texture(
+        &mut self,
+        queue: &Queue,
+        encoded_paints: &[GpuEncodedPaint],
+        required_texels: u32,
+    ) {
+        if encoded_paints.is_empty() {
+            return;
+        }
+        self.encoded_paints_data
+            .resize(required_texels as usize * 16, 0);
         GpuEncodedPaint::serialize_to_buffer(encoded_paints, &mut self.encoded_paints_data);
-        self.diagnostics.upload(
-            UploadKind::Paint,
-            u64::from(encoded_paints_texture_width) * u64::from(encoded_paints_texture_height) * 16,
-        );
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: encoded_paints_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
+        upload_data_texture(
+            queue,
+            &self.resources.encoded_paints_texture,
             &self.encoded_paints_data,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                // 16 bytes per RGBA32Uint texel (4 u32s × 4 bytes each), equivalent to bit shift of 4
-                bytes_per_row: Some(encoded_paints_texture_width << 4),
-                rows_per_image: Some(encoded_paints_texture_height),
-            },
-            Extent3d {
-                width: encoded_paints_texture_width,
-                height: encoded_paints_texture_height,
-                depth_or_array_layers: 1,
-            },
+            &mut self.texture_upload_scratch,
+            &mut self.diagnostics,
+            UploadKind::Paint,
         );
     }
 
@@ -2779,80 +2722,29 @@ impl Programs {
         if filter_context.is_empty() {
             return;
         }
-
-        let filter_texture = &self.resources.filter_data_texture;
-        let width = filter_texture.width();
-        let height = filter_texture.height();
-
+        self.filter_data
+            .resize(filter_context.total_texels() as usize * 16, 0);
         filter_context.serialize_to_buffer(&mut self.filter_data);
-        self.diagnostics.upload(
-            UploadKind::Filter,
-            u64::from(width) * u64::from(height) * 16,
-        );
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: filter_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
+        upload_data_texture(
+            queue,
+            &self.resources.filter_data_texture,
             &self.filter_data,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(width << 4),
-                rows_per_image: Some(height),
-            },
-            Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
+            &mut self.texture_upload_scratch,
+            &mut self.diagnostics,
+            UploadKind::Filter,
         );
     }
 
     /// Upload gradient data to the texture.
-    fn upload_gradient_texture(&mut self, queue: &Queue, gradient_cache: &mut GradientRampCache) {
-        let gradient_texture = &self.resources.gradient_texture;
-        let gradient_texture_width = gradient_texture.width();
-        let gradient_texture_height = gradient_texture.height();
-
-        // Upload the gradient LUT data
-        if !gradient_cache.is_empty() {
-            let bytes_per_texel = gradient_cache.bytes_per_texel();
-            let total_capacity =
-                (gradient_texture_width * gradient_texture_height * bytes_per_texel) as usize;
-
-            // Take ownership of the luts to avoid copying, then resize for texture padding
-            let mut luts = gradient_cache.take_luts();
-            let old_luts_len = luts.len();
-            luts.resize(total_capacity, 0);
-            self.diagnostics
-                .upload(UploadKind::Gradient, total_capacity as u64);
-
-            queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: gradient_texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                &luts,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(gradient_texture_width * bytes_per_texel),
-                    rows_per_image: Some(gradient_texture_height),
-                },
-                Extent3d {
-                    width: gradient_texture_width,
-                    height: gradient_texture_height,
-                    depth_or_array_layers: 1,
-                },
-            );
-
-            // Restore the luts back to the cache
-            luts.truncate(old_luts_len);
-            gradient_cache.restore_luts(luts);
-        }
+    fn upload_gradient_texture(&mut self, queue: &Queue, gradient_cache: &GradientRampCache) {
+        upload_data_texture(
+            queue,
+            &self.resources.gradient_texture,
+            gradient_cache.luts(),
+            &mut self.texture_upload_scratch,
+            &mut self.diagnostics,
+            UploadKind::Gradient,
+        );
     }
 
     /// Uploads two strip slices (opaque then alpha) into a single GPU buffer.
@@ -2890,6 +2782,59 @@ impl Programs {
             offset += bytes.len();
         }
     }
+}
+
+fn upload_data_texture(
+    queue: &Queue,
+    texture: &Texture,
+    data: &[u8],
+    scratch: &mut Vec<u8>,
+    diagnostics: &mut Diagnostics,
+    kind: UploadKind,
+) {
+    if data.is_empty() {
+        return;
+    }
+    let bytes_per_texel = texture.format().block_copy_size(None).unwrap();
+    let texels = u32::try_from(data.len().div_ceil(bytes_per_texel as usize)).unwrap();
+    let width = texture.width().min(texels);
+    let height = texels.div_ceil(width);
+    debug_assert!(height <= texture.height());
+    let bytes_per_row = width * bytes_per_texel;
+    let upload_len = bytes_per_row as usize * height as usize;
+
+    // Multi-row uploads retain the shader's full texture stride. A single-row upload
+    // can be narrower; queue writes do not require 256-byte row alignment.
+    let data = if data.len() == upload_len {
+        data
+    } else {
+        scratch.clear();
+        scratch.extend_from_slice(data);
+        scratch.resize(upload_len, 0);
+        scratch.as_slice()
+    };
+    // Queue writes copy the source before returning, so later uploads can reuse this
+    // scratch. Destination textures still require the ordinary per-render submission boundary.
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        data,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(bytes_per_row),
+            rows_per_image: Some(height),
+        },
+        Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+    diagnostics.upload(kind, upload_len as u64);
 }
 
 /// A struct containing references to the many objects needed to get work
