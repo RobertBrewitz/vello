@@ -95,6 +95,11 @@ fn load_shader_names(shader_dir: &Path) -> Vec<String> {
     shader_names
 }
 
+fn supports_glsl(name: &str) -> bool {
+    // MRT fragment struct returns are intentionally outside the WebGL shader contract.
+    name != "render_mrt"
+}
+
 fn compile_shader<R: wesl::Resolver>(compiler: &Wesl<R>, name: String) -> ShaderInfo {
     let module_path = format!("package::{name}")
         .parse()
@@ -103,6 +108,17 @@ fn compile_shader<R: wesl::Resolver>(compiler: &Wesl<R>, name: String) -> Shader
         .compile(&module_path)
         .unwrap_or_else(|error| panic!("Unable to compile `{name}.wesl`: {error}"))
         .to_string();
+
+    if !supports_glsl(&name) {
+        let module = naga::front::wgsl::parse_str(&linked_wgsl)
+            .unwrap_or_else(|error| panic!("{name}: {}", error.emit_to_string(&linked_wgsl)));
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::default(),
+        )
+        .validate(&module)
+        .unwrap_or_else(|error| panic!("Invalid wgpu-only shader {name}: {error:?}"));
+    }
 
     #[cfg(feature = "unminified")]
     let wgsl_source = linked_wgsl;
@@ -149,6 +165,25 @@ fn generate_compiled_shaders_module(shader_infos: &[ShaderInfo]) -> String {
         writeln!(buf, "        (\"{}\", {const_name}),", shader_info.name).unwrap();
     }
     writeln!(buf, "    ];").unwrap();
+    writeln!(
+        buf,
+        "    /// Shaders supporting the WebGL GLSL/lint contract."
+    )
+    .unwrap();
+    writeln!(buf, "    pub const WEBGL_COMPATIBLE: &[(&str, &str)] = &[").unwrap();
+    for shader_info in shader_infos
+        .iter()
+        .filter(|shader| supports_glsl(&shader.name))
+    {
+        writeln!(
+            buf,
+            "        (\"{}\", {}),",
+            shader_info.name,
+            shader_info.name.to_uppercase()
+        )
+        .unwrap();
+    }
+    writeln!(buf, "    ];").unwrap();
     writeln!(buf, "}}").unwrap();
 
     // Implementation for creating a CompiledGlsl struct per shader assuming the standard entry
@@ -161,7 +196,10 @@ fn generate_compiled_shaders_module(shader_infos: &[ShaderInfo]) -> String {
         )
         .unwrap();
 
-        for shader_info in shader_infos {
+        for shader_info in shader_infos
+            .iter()
+            .filter(|shader| supports_glsl(&shader.name))
+        {
             let shader = compile::compile_wgsl_shader(
                 &shader_info.wgsl_source,
                 &shader_info.name,

@@ -14,6 +14,15 @@ const MAX_GROUP_BYTES: usize = 4 * 1024 * 1024;
 const MAX_GROUP_DRAWS: usize = 4096;
 const MAX_GROUP_STRIPS: usize = 65536;
 
+/// RGB destination for a source-over scene; coverage attenuates both destinations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RadianceRoute {
+    /// Contributes RGB to the lit attachment.
+    Lit,
+    /// Contributes RGB to the unlit attachment.
+    Unlit,
+}
+
 #[derive(Debug, Default)]
 pub(super) struct FlatGroupStorage {
     alphas: Vec<u8>,
@@ -48,6 +57,7 @@ pub struct PreparedFlatGroup<'a> {
     queue: &'a Queue,
     encoder: &'a mut CommandEncoder,
     view: &'a TextureView,
+    radiance_view: Option<&'a TextureView>,
     texture_bindings: &'a TextureBindings,
 }
 
@@ -110,6 +120,119 @@ impl PreparedFlatGroup<'_> {
             .end_timer(started, |cpu| &mut cpu.render);
     }
 
+    /// Draw all prepared scenes into the two radiance attachments in one pass.
+    /// `clear` initializes both attachments to transparent; otherwise both are loaded.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless prepared with [`Renderer::prepare_radiance_group`], or if the route
+    /// count differs from [`Self::scene_count`].
+    pub fn render_radiance(&mut self, routes: &[RadianceRoute], clear: bool) {
+        let unlit_view = self
+            .radiance_view
+            .expect("Group was not prepared for radiance output");
+        assert_eq!(routes.len(), self.scene_count());
+        let started = self.renderer.programs.diagnostics.start_timer();
+        let mut ctx = RendererContext {
+            programs: &mut self.renderer.programs,
+            device: self.device,
+            queue: self.queue,
+            encoder: self.encoder,
+            view: self.view,
+            depth_view: None,
+            texture_bindings: self.texture_bindings,
+            external_texture_bind_groups: core::mem::take(&mut self.storage.bindings),
+            scratch_buffers: &mut self.renderer.scratch_buffers,
+            pending_root_clear: false,
+            uploaded_strips: None,
+        };
+        for draw in &self.storage.draws[..routes.len()] {
+            for run in &draw.external_texture_runs {
+                ctx.external_texture_bind_group_for_textures(run.bindings);
+            }
+        }
+        ctx.programs
+            .ensure_strip_bind_group(self.device, (StripTargetKind::Root, None));
+        self.storage.bindings = ctx.external_texture_bind_groups;
+        let programs = &mut self.renderer.programs;
+        programs
+            .diagnostics
+            .update(|report| report.render_calls += routes.len() as u64);
+        let attachments = [self.view, unlit_view].map(|view| {
+            Some(RenderPassColorAttachment {
+                view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: if clear {
+                        wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT)
+                    } else {
+                        wgpu::LoadOp::Load
+                    },
+                    store: wgpu::StoreOp::Store,
+                },
+            })
+        });
+        let mut pass = self.encoder.begin_render_pass(&RenderPassDescriptor {
+            label: Some("Flat Group Radiance"),
+            color_attachments: &attachments,
+            depth_stencil_attachment: None,
+            timestamp_writes: programs.diagnostics.pass(PassKind::RootRadiance),
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_bind_group(
+            0,
+            &programs.strip_layer_bind_groups[&(StripTargetKind::Root, None)],
+            &[],
+        );
+        pass.set_bind_group(2, &programs.resources.encoded_paints_bind_group, &[]);
+        pass.set_bind_group(3, &programs.resources.gradient_bind_group, &[]);
+        if let Some(buffer) = &self.storage.strip_buffer {
+            pass.set_vertex_buffer(0, buffer.slice(..));
+        }
+        let pipelines = programs.radiance_pipelines.as_ref().unwrap();
+        for (index, route) in routes.iter().enumerate() {
+            let range = &self.storage.ranges[index];
+            if range.is_empty() {
+                continue;
+            }
+            pass.set_pipeline(
+                &pipelines[match route {
+                    RadianceRoute::Lit => 0,
+                    RadianceRoute::Unlit => 1,
+                }],
+            );
+            let first = (range.start / size_of::<GpuStrip>() as u64) as u32;
+            let count = ((range.end - range.start) / size_of::<GpuStrip>() as u64) as u32;
+            let runs = &self.storage.draws[index].external_texture_runs;
+            if runs.is_empty() {
+                pass.set_bind_group(
+                    1,
+                    &programs.resources.empty_external_texture_bind_group,
+                    &[],
+                );
+                pass.draw(0..4, first..first + count);
+            } else {
+                for (run_index, run) in runs.iter().enumerate() {
+                    pass.set_bind_group(1, &self.storage.bindings[&run.bindings], &[]);
+                    let start = run.strips_start as u32;
+                    let end = runs
+                        .get(run_index + 1)
+                        .map_or(count, |next| next.strips_start as u32);
+                    pass.draw(0..4, first + start..first + end);
+                }
+            }
+        }
+        drop(pass);
+        programs
+            .diagnostics
+            .end_timer(started, |cpu| &mut cpu.pass_recording);
+        programs
+            .diagnostics
+            .end_timer(started, |cpu| &mut cpu.render);
+    }
+
     /// Access the group's encoder to compose or copy each scene's result in order.
     pub fn encoder(&mut self) -> &mut CommandEncoder {
         self.encoder
@@ -156,6 +279,85 @@ impl Renderer {
         view: &'a TextureView,
         texture_bindings: &'a TextureBindings,
     ) -> Result<Option<PreparedFlatGroup<'a>>, RenderError> {
+        self.prepare_group(
+            scenes,
+            resources,
+            device,
+            queue,
+            encoder,
+            render_size,
+            view,
+            None,
+            texture_bindings,
+        )
+    }
+
+    /// Prepare HDR scenes for direct dual-radiance rendering in painter order.
+    /// The two targets must be distinct full-size, single-sample RGBA16F 2D views.
+    /// Returns `None` for unsupported devices/renderers or an ineligible first scene.
+    /// The frame, group bounds and submission contract match [`Self::prepare_flat_group`].
+    pub fn prepare_radiance_group<'a>(
+        &'a mut self,
+        scenes: &[&Scene],
+        resources: &mut Resources,
+        device: &'a Device,
+        queue: &'a Queue,
+        encoder: &'a mut CommandEncoder,
+        render_size: &RenderSize,
+        views: [&'a TextureView; 2],
+        texture_bindings: &'a TextureBindings,
+    ) -> Result<Option<PreparedFlatGroup<'a>>, RenderError> {
+        if !self.hdr
+            || device.limits().max_color_attachments < 2
+            || device.limits().max_color_attachment_bytes_per_sample < 16
+        {
+            return Ok(None);
+        }
+        if views[0].texture() == views[1].texture()
+            || views.iter().any(|view| {
+                let texture = view.texture();
+                texture.format() != wgpu::TextureFormat::Rgba16Float
+                    || texture.sample_count() != 1
+                    || texture.dimension() != wgpu::TextureDimension::D2
+                    || texture.depth_or_array_layers() != 1
+                    || texture.width() != render_size.width
+                    || texture.height() != render_size.height
+                    || !texture
+                        .usage()
+                        .contains(wgpu::TextureUsages::RENDER_ATTACHMENT)
+            })
+        {
+            return Err(RenderError::InvalidRadianceTarget);
+        }
+        if self.flat_group_prefix(scenes, device) == 0 {
+            return Ok(None);
+        }
+        self.programs.ensure_radiance_pipelines(device);
+        self.prepare_group(
+            scenes,
+            resources,
+            device,
+            queue,
+            encoder,
+            render_size,
+            views[0],
+            Some(views[1]),
+            texture_bindings,
+        )
+    }
+
+    fn prepare_group<'a>(
+        &'a mut self,
+        scenes: &[&Scene],
+        resources: &mut Resources,
+        device: &'a Device,
+        queue: &'a Queue,
+        encoder: &'a mut CommandEncoder,
+        render_size: &RenderSize,
+        view: &'a TextureView,
+        radiance_view: Option<&'a TextureView>,
+        texture_bindings: &'a TextureBindings,
+    ) -> Result<Option<PreparedFlatGroup<'a>>, RenderError> {
         assert!(
             resources.frame_active,
             "Flat groups require an explicit resource frame"
@@ -196,6 +398,7 @@ impl Renderer {
             queue,
             render_size,
             view,
+            radiance_view,
             texture_bindings,
         );
         self.programs
@@ -217,6 +420,7 @@ impl Renderer {
             queue,
             encoder,
             view,
+            radiance_view,
             texture_bindings,
         }))
     }
@@ -284,6 +488,7 @@ impl Renderer {
         queue: &Queue,
         render_size: &RenderSize,
         view: &TextureView,
+        radiance_view: Option<&TextureView>,
         texture_bindings: &TextureBindings,
     ) -> Result<(), RenderError> {
         storage
@@ -291,6 +496,18 @@ impl Renderer {
             .resize_with(storage.draws.len().max(scenes.len()), Draw::default);
         let mut paint_texels = 0;
         for (index, scene) in scenes.iter().enumerate() {
+            if let Some(radiance_view) = radiance_view {
+                for paint in &scene.encoded_paints {
+                    if let EncodedPaint::Image(image) = paint
+                        && let ImageSource::ExternalTexture { id, .. } = &image.source
+                        && texture_bindings
+                            .get(*id)
+                            .is_some_and(|view| view.texture() == radiance_view.texture())
+                    {
+                        return Err(RenderError::TextureFeedbackLoop(*id));
+                    }
+                }
+            }
             let started = self.programs.diagnostics.start_timer();
             let result = self.prepare_gpu_encoded_paints(
                 &scene.encoded_paints,
@@ -395,5 +612,67 @@ impl Renderer {
             .diagnostics
             .end_timer(started, |cpu| &mut cpu.resource_preparation);
         Ok(())
+    }
+}
+
+impl Programs {
+    fn ensure_radiance_pipelines(&mut self, device: &Device) {
+        if self.radiance_pipelines.is_some() {
+            return;
+        }
+        let vertex = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Radiance Strip Vertex"),
+            source: wgpu::ShaderSource::Wgsl(vello_gpu_shaders::wgsl::RENDER.into()),
+        });
+        let fragment = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Radiance Strip Fragment"),
+            source: wgpu::ShaderSource::Wgsl(vello_gpu_shaders::wgsl::RENDER_MRT.into()),
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Radiance Strip Layout"),
+            bind_group_layouts: &[
+                Some(&self.strip_bind_group_layout),
+                Some(&self.external_texture_bind_group_layout),
+                Some(&self.encoded_paints_bind_group_layout),
+                Some(&self.gradient_bind_group_layout),
+            ],
+            immediate_size: 0,
+        });
+        self.radiance_pipelines = Some(["fs_lit", "fs_unlit"].map(|entry| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(entry),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: &vertex,
+                    entry_point: Some("vs_main"),
+                    compilation_options: PipelineCompilationOptions::default(),
+                    buffers: &[wgpu::VertexBufferLayout {
+                        array_stride: size_of::<GpuStrip>() as u64,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &GpuStrip::vertex_attributes(),
+                    }],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &fragment,
+                    entry_point: Some(entry),
+                    compilation_options: PipelineCompilationOptions::default(),
+                    targets: &core::array::from_fn::<_, 2, _>(|_| {
+                        Some(ColorTargetState {
+                            format: wgpu::TextureFormat::Rgba16Float,
+                            blend: Some(BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                            write_mask: ColorWrites::ALL,
+                        })
+                    }),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleStrip,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        }));
     }
 }

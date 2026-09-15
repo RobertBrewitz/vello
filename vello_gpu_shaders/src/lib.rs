@@ -21,12 +21,12 @@ mod tests {
     use crate::lint::lint;
 
     #[test]
-    fn every_shipped_shader_passes_the_lint() {
+    fn every_webgl_shader_passes_the_lint() {
         assert!(
-            !crate::wgsl::ALL.is_empty(),
+            !crate::wgsl::WEBGL_COMPATIBLE.is_empty(),
             "expected at least one linked WESL shader"
         );
-        for &(name, source) in crate::wgsl::ALL {
+        for &(name, source) in crate::wgsl::WEBGL_COMPATIBLE {
             let module = wgsl::parse_str(source).expect("linked WGSL parses");
             lint(name, &module);
         }

@@ -102,7 +102,7 @@ pub use render::{
 };
 #[cfg(feature = "wgpu")]
 pub use render::{
-    AtlasWriter, MAX_FLAT_GROUP_SCENES, PreparedFlatGroup, RenderTargetConfig, Renderer,
+    AtlasWriter, MAX_FLAT_GROUP_SCENES, PreparedFlatGroup, RadianceRoute, RenderTargetConfig, Renderer,
     TextureBindings, diagnostics,
 };
 pub use render::{Config, GpuStrip, RenderSize};
@@ -136,6 +136,9 @@ pub enum RenderError {
     /// HDR requires a nonempty RGBA16F texture rather than an SDR canvas or attachment.
     #[error("HDR requires a nonempty RGBA16F render target")]
     InvalidHdrTarget,
+    /// Dual-radiance targets must be distinct, equally sized single-sample RGBA16F textures.
+    #[error("Invalid dual-radiance render targets")]
+    InvalidRadianceTarget,
     /// An image atlas allocation failed.
     #[error("Atlas allocation failed: {0}")]
     AtlasError(#[from] vello_common::multi_atlas::AtlasError),

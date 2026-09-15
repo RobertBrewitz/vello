@@ -22,10 +22,11 @@ pub enum RenderPassKind {
     Filter,
     LayerClear,
     AtlasClear,
+    RootRadiance,
 }
 
 impl RenderPassKind {
-    pub const COUNT: usize = 10;
+    pub const COUNT: usize = 11;
 }
 
 #[derive(Clone, Copy, Debug, Default)]

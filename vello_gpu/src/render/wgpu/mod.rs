@@ -21,7 +21,7 @@ only break in edge cases, and some of them are also only related to conversions 
 pub mod diagnostics;
 mod group;
 
-pub use group::{MAX_FLAT_GROUP_SCENES, PreparedFlatGroup};
+pub use group::{MAX_FLAT_GROUP_SCENES, PreparedFlatGroup, RadianceRoute};
 
 use crate::draw::{EXTERNAL_TEXTURE_SLOT_COUNT, ExternalTextureBindings, ExternalTextureRun};
 use crate::render::common::IMAGE_PADDING;
@@ -1225,6 +1225,7 @@ struct Programs {
     image_bind_groups: HashMap<[TextureView; EXTERNAL_TEXTURE_SLOT_COUNT], BindGroup>,
     image_bind_group_order: VecDeque<[TextureView; EXTERNAL_TEXTURE_SLOT_COUNT]>,
     flat_group: group::FlatGroupStorage,
+    radiance_pipelines: Option<[RenderPipeline; 2]>,
 }
 
 /// Contains all GPU resources needed for rendering
@@ -2010,6 +2011,7 @@ impl Programs {
             image_bind_groups: HashMap::new(),
             image_bind_group_order: VecDeque::new(),
             flat_group: group::FlatGroupStorage::default(),
+            radiance_pipelines: None,
             render_size: RenderSize {
                 width: render_target_config.width,
                 height: render_target_config.height,
@@ -2417,6 +2419,30 @@ impl Programs {
                 resource: wgpu::BindingResource::TextureView(gradient_texture_view),
             }],
         })
+    }
+
+    fn ensure_strip_bind_group(
+        &mut self,
+        device: &Device,
+        key: (StripTargetKind, Option<LayerTextureId>),
+    ) {
+        if self.strip_layer_bind_groups.contains_key(&key) {
+            return;
+        }
+        let config = match key.0 {
+            StripTargetKind::Root => &self.resources.view_config_buffer,
+            StripTargetKind::Layer => &self.resources.layer_config_buffer,
+        };
+        let child_view = key.1.map_or(
+            &self.resources.placeholder_external_texture_view,
+            |id| self.resources.layer_view(id),
+        );
+        let alpha_view = self.resources.alphas_texture.create_view(&TextureViewDescriptor::default());
+        let bind_group = Self::create_strip_bind_group(
+            device, &self.strip_bind_group_layout, &alpha_view, config, child_view,
+        );
+        self.diagnostics.bind_groups(BindGroupKind::Strip, 1);
+        self.strip_layer_bind_groups.insert(key, bind_group);
     }
 
     fn create_strip_bind_group(
@@ -2974,48 +3000,16 @@ impl RendererContext<'_> {
         let opaque_count = opaque_count as u32;
         let alpha_count = alpha_count as u32;
 
-        let (view, config_buffer, bind_group_target) = match target {
-            DrawPassTarget::Root(_) => (
-                self.view,
-                &self.programs.resources.view_config_buffer,
-                StripTargetKind::Root,
-            ),
-            DrawPassTarget::Layer(id) => (
-                self.programs.resources.layer_view(id),
-                &self.programs.resources.layer_config_buffer,
-                StripTargetKind::Layer,
-            ),
+        let bind_group_target = match target {
+            DrawPassTarget::Root(_) => StripTargetKind::Root,
+            DrawPassTarget::Layer(_) => StripTargetKind::Layer,
         };
         let bind_group_key = (bind_group_target, child_layer_texture);
-        if !self
-            .programs
-            .strip_layer_bind_groups
-            .contains_key(&bind_group_key)
-        {
-            let child_layer_view = child_layer_texture.map_or(
-                &self.programs.resources.placeholder_external_texture_view,
-                |id| self.programs.resources.layer_view(id),
-            );
-            let alphas_texture_view = self
-                .programs
-                .resources
-                .alphas_texture
-                .create_view(&TextureViewDescriptor::default());
-            self.programs
-                .diagnostics
-                .bind_groups(BindGroupKind::Strip, 1);
-            let bind_group = Programs::create_strip_bind_group(
-                self.device,
-                &self.programs.strip_bind_group_layout,
-                &alphas_texture_view,
-                config_buffer,
-                child_layer_view,
-            );
-            self.programs
-                .strip_layer_bind_groups
-                .insert(bind_group_key, bind_group);
-        }
-
+        self.programs.ensure_strip_bind_group(self.device, bind_group_key);
+        let view = match target {
+            DrawPassTarget::Root(_) => self.view,
+            DrawPassTarget::Layer(id) => self.programs.resources.layer_view(id),
+        };
         let bind_group = &self.programs.strip_layer_bind_groups[&bind_group_key];
 
         let enable_opaque = self.depth_view.is_some() && target.enable_opaque();

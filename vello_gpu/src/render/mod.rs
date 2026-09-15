@@ -27,6 +27,6 @@ pub use webgl::{
 };
 #[cfg(feature = "wgpu")]
 pub use wgpu::{
-    AtlasWriter, MAX_FLAT_GROUP_SCENES, PreparedFlatGroup, RenderTargetConfig, Renderer,
+    AtlasWriter, MAX_FLAT_GROUP_SCENES, PreparedFlatGroup, RadianceRoute, RenderTargetConfig, Renderer,
     TextureBindings, diagnostics,
 };

@@ -346,6 +346,19 @@ fn fs_main(
     @location(5) @interpolate(flat) rect_frac: u32,
     @builtin(position) position: vec4<f32>,
 ) -> @location(0) vec4<f32> {
+    return shade_fragment(paint_and_rect_flag, tex_coord, sample_xy,
+        dense_end_or_rect_size, payload, rect_frac, position);
+}
+
+fn shade_fragment(
+    paint_and_rect_flag: u32,
+    tex_coord: vec2<f32>,
+    sample_xy: vec2<f32>,
+    dense_end_or_rect_size: u32,
+    payload: u32,
+    rect_frac: u32,
+    position: vec4<f32>,
+) -> vec4<f32> {
     var alpha = 1.0;
     let is_rect = (paint_and_rect_flag & RECT_STRIP_FLAG) != 0u;
     // TODO: Explore doing these calculations only for rectangle parts that actually need anti-aliasing. See

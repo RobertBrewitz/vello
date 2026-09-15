@@ -23,7 +23,7 @@ fn main() {
     )
     .unwrap();
 
-    for &(name, wgsl_source) in vello_gpu_shaders::wgsl::ALL {
+    for &(name, wgsl_source) in vello_gpu_shaders::wgsl::WEBGL_COMPATIBLE {
         let shader = compile::compile_wgsl_shader(
             wgsl_source,
             name,
