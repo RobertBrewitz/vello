@@ -16,8 +16,21 @@ pub(super) async fn render_to_png(scene: &Scene, output: impl AsRef<Path>) {
         .request_adapter(&wgpu::RequestAdapterOptions::default())
         .await
         .expect("Failed to find a GPU adapter");
+    let diagnostics = std::env::var("VELLO_GPU_DIAGNOSTICS").ok().map(|value| {
+        value
+            .parse::<u32>()
+            .expect("VELLO_GPU_DIAGNOSTICS must be a GPU pass budget (0 for CPU only)")
+    });
+    let required_features = if diagnostics.is_some_and(|budget| budget > 0) {
+        adapter.features() & wgpu::Features::TIMESTAMP_QUERY
+    } else {
+        wgpu::Features::empty()
+    };
     let (device, queue) = adapter
-        .request_device(&wgpu::DeviceDescriptor::default())
+        .request_device(&wgpu::DeviceDescriptor {
+            required_features,
+            ..Default::default()
+        })
         .await
         .expect("Failed to create device");
     let size = wgpu::Extent3d {
@@ -42,6 +55,14 @@ pub(super) async fn render_to_png(scene: &Scene, output: impl AsRef<Path>) {
         height,
     };
     let (mut renderer, mut resources) = Renderer::new(&device, &config);
+    if let Some(budget) = diagnostics {
+        eprintln!(
+            "adapter={:?} target={width}x{height} limits={:?}",
+            adapter.get_info(),
+            device.limits()
+        );
+        renderer.begin_diagnostics(&device, &queue, budget);
+    }
     let render_size = RenderSize { width, height };
     let depth = Renderer::create_depth_texture_view(&device, &render_size);
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
@@ -83,11 +104,26 @@ pub(super) async fn render_to_png(scene: &Scene, output: impl AsRef<Path>) {
         },
         size,
     );
-    queue.submit([encoder.finish()]);
+    renderer.finish_diagnostics(&mut encoder);
+    let started = diagnostics.map(|_| std::time::Instant::now());
+    let commands = encoder.finish();
+    let finish_time = started.map(|start| start.elapsed());
+    let started = diagnostics.map(|_| std::time::Instant::now());
+    queue.submit([commands]);
+    if let Some(started) = started {
+        eprintln!(
+            "caller finish={:?} submit={:?}",
+            finish_time.unwrap(),
+            started.elapsed()
+        );
+    }
     readback.slice(..).map_async(wgpu::MapMode::Read, |result| {
         result.expect("Failed to map PNG readback");
     });
     device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+    if let Some(report) = renderer.take_diagnostics() {
+        eprintln!("{report:#?}");
+    }
 
     let mut pixels =
         Vec::with_capacity(usize::from(scene.width()) * usize::from(scene.height()) * 4);

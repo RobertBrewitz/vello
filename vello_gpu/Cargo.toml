@@ -24,6 +24,7 @@ vello_gpu_shaders = { workspace = true, optional = true }
 log = { workspace = true }
 hashbrown = { workspace = true }
 half = { version = "2.7", default-features = false }
+web-time = { workspace = true, optional = true }
 
 js-sys = { workspace = true, optional = true }
 web-sys = { workspace = true, features = [
@@ -51,7 +52,7 @@ roxmltree = "0.20.0"
 default = ["wgpu", "wgpu_default", "text"]
 std = ["vello_common/std", "glifo?/std"]
 libm = ["vello_common/libm", "glifo?/libm"]
-wgpu = ["dep:wgpu", "dep:vello_gpu_shaders"]
+wgpu = ["dep:wgpu", "dep:vello_gpu_shaders", "dep:web-time"]
 # Enable wgpu with its default features. If you need to customise the set of enabled wgpu features,
 # please disable this crate's default features, enable its "wgpu" feature, then depend on wgpu directly
 # with the features which you need enabled.

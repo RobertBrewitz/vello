@@ -26,4 +26,4 @@ pub use webgl::{
     WebGlTextureBindings, WebGlTextureWithDimensions,
 };
 #[cfg(feature = "wgpu")]
-pub use wgpu::{AtlasWriter, RenderTargetConfig, Renderer, TextureBindings};
+pub use wgpu::{AtlasWriter, RenderTargetConfig, Renderer, TextureBindings, diagnostics};

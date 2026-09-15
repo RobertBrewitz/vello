@@ -18,6 +18,8 @@
 only break in edge cases, and some of them are also only related to conversions from f64 to f32."
 )]
 
+pub mod diagnostics;
+
 use crate::draw::{EXTERNAL_TEXTURE_SLOT_COUNT, ExternalTextureBindings, ExternalTextureRun};
 use crate::render::common::IMAGE_PADDING;
 use crate::util::RangedSlice;
@@ -52,6 +54,10 @@ use crate::{
 use alloc::vec::Vec;
 use alloc::{sync::Arc, vec};
 use core::{fmt::Debug, num::NonZeroU64};
+use diagnostics::{
+    Diagnostics, RenderBindGroupKind as BindGroupKind, RenderBufferKind as BufferKind,
+    RenderDiagnostics, RenderPassKind as PassKind, RenderUploadKind as UploadKind,
+};
 #[cfg(feature = "text")]
 use glifo::PendingClearRect;
 use hashbrown::{HashMap, hash_map::Entry};
@@ -261,6 +267,36 @@ impl Renderer {
         (renderer, resources)
     }
 
+    /// Begin an opt-in capture spanning any number of ordinary renders, including atlas work.
+    /// Returns false while a previous capture is active or awaiting collection.
+    /// `max_gpu_passes` is clamped to half the device query-count limit; zero disables timestamps.
+    /// GPU timing requires TIMESTAMP_QUERY to have been enabled when creating the device.
+    /// Without it, CPU/work counters still function. Diagnostic resources are excluded from counts.
+    pub fn begin_diagnostics(
+        &mut self,
+        device: &Device,
+        queue: &Queue,
+        max_gpu_passes: u32,
+    ) -> bool {
+        self.programs
+            .diagnostics
+            .begin(device, queue, max_gpu_passes)
+    }
+
+    /// Stop capture and append timestamp resolve/readback commands to the final encoder.
+    /// Submit this encoder after all captured work, on the same queue. This does not submit or wait.
+    /// Ordinary render submission boundaries must still be preserved during a capture.
+    pub fn finish_diagnostics(&mut self, encoder: &mut CommandEncoder) {
+        self.programs.diagnostics.finish(encoder);
+    }
+
+    /// Collect a finished capture without waiting. Returns None until GPU mapping completes.
+    /// The application's normal device polling/event loop must drive wgpu callbacks. CPU-only
+    /// captures can be collected immediately after finish_diagnostics. Only one capture is retained.
+    pub fn take_diagnostics(&mut self) -> Option<RenderDiagnostics> {
+        self.programs.diagnostics.take()
+    }
+
     /// Creates a depth texture view compatible with [`render`](Self::render).
     ///
     /// The returned view has the same dimensions as `render_size`, uses
@@ -304,6 +340,44 @@ impl Renderer {
     ///
     /// [WebGPU render pass validation rules]: https://gpuweb.github.io/gpuweb/#abstract-opdef-gpurenderpassdescriptor-valid-usage
     pub fn render(
+        &mut self,
+        scene: &Scene,
+        resources: &mut Resources,
+        device: &Device,
+        queue: &Queue,
+        encoder: &mut CommandEncoder,
+        render_size: &RenderSize,
+        view: &TextureView,
+        depth_view: Option<&TextureView>,
+        texture_bindings: &TextureBindings,
+    ) -> Result<(), RenderError> {
+        let started = self.programs.diagnostics.start_timer();
+        self.programs
+            .diagnostics
+            .update(|report| report.render_calls += 1);
+        let result = self.render_inner(
+            scene,
+            resources,
+            device,
+            queue,
+            encoder,
+            render_size,
+            view,
+            depth_view,
+            texture_bindings,
+        );
+        self.programs
+            .diagnostics
+            .end_timer(started, |cpu| &mut cpu.render);
+        if result.is_err() {
+            self.programs
+                .diagnostics
+                .update(|report| report.render_errors += 1);
+        }
+        result
+    }
+
+    fn render_inner(
         &mut self,
         scene: &Scene,
         resources: &mut Resources,
@@ -426,6 +500,10 @@ impl Renderer {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("Render to Atlas Encoder"),
         });
+        self.programs.diagnostics.update(|report| {
+            report.atlas_render_calls += 1;
+            report.internal_encoders += 1;
+        });
 
         Programs::maybe_create_atlas_textures(device, &mut self.programs.resources, atlas_count);
 
@@ -461,7 +539,19 @@ impl Renderer {
 
         // Submit immediately so the atlas content is committed before subsequent
         // render() calls overwrite the shared alpha/config/paint resources.
-        queue.submit(Some(encoder.finish()));
+        let started = self.programs.diagnostics.start_timer();
+        let command_buffer = encoder.finish();
+        self.programs
+            .diagnostics
+            .end_timer(started, |cpu| &mut cpu.atlas_finish);
+        let started = self.programs.diagnostics.start_timer();
+        queue.submit(Some(command_buffer));
+        self.programs
+            .diagnostics
+            .end_timer(started, |cpu| &mut cpu.atlas_submit);
+        self.programs
+            .diagnostics
+            .update(|report| report.internal_submissions += 1);
 
         result
     }
@@ -499,12 +589,18 @@ impl Renderer {
         texture_bindings: &TextureBindings,
     ) -> Result<(), RenderError> {
         self.programs.depth_cleared_this_frame = false;
-        self.prepare_gpu_encoded_paints(
+        let started = self.programs.diagnostics.start_timer();
+        let result = self.prepare_gpu_encoded_paints(
             encoded_paints,
             image_cache,
             texture_bindings,
             view.texture(),
-        )?;
+        );
+        self.programs
+            .diagnostics
+            .end_timer(started, |cpu| &mut cpu.paint_preparation);
+        result?;
+        let started = self.programs.diagnostics.start_timer();
         let required_texture_size = self
             .layers_config
             .required_intermediate_texture_size(&scene.recorder)?;
@@ -530,7 +626,15 @@ impl Renderer {
             texture_size,
             current_allocations,
             self.layers_config.max_textures,
-        )?;
+        );
+        self.programs
+            .diagnostics
+            .end_timer(started, |cpu| &mut cpu.scheduling);
+        let schedule = schedule?;
+        self.programs
+            .diagnostics
+            .update(|report| report.scheduler_rounds += schedule.round_count() as u64);
+        let started = self.programs.diagnostics.start_timer();
         self.schedule_storage
             .filter_context
             .set_linear_color(linear);
@@ -539,6 +643,13 @@ impl Renderer {
         // TODO: For the time being, we upload the entire alpha buffer as one big chunk. As a future
         // refinement, we could have a bounded alpha buffer, and break draws when the alpha
         // buffer fills.
+        let alpha_before = self.programs.diagnostics.is_active().then(|| {
+            let storage = scene.strip_storage.borrow();
+            (
+                storage.alphas.len() as u64,
+                storage.alphas.capacity() as u64,
+            )
+        });
         self.programs.prepare(
             device,
             queue,
@@ -550,6 +661,22 @@ impl Renderer {
             &self.schedule_storage.filter_context,
         );
 
+        if let Some((active, before)) = alpha_before {
+            let after = scene.strip_storage.borrow().alphas.capacity() as u64;
+            self.programs.diagnostics.update(|report| {
+                let stats = if root_output_target == RootTarget::UserSurface {
+                    &mut report.scene_alphas
+                } else {
+                    &mut report.atlas_alphas
+                };
+                stats.observations += 1;
+                stats.active_bytes += active;
+                stats.capacity_before_bytes += before;
+                stats.capacity_after_bytes += after;
+                stats.capacity_growth_bytes += after.saturating_sub(before);
+                stats.max_capacity_after_bytes = stats.max_capacity_after_bytes.max(after);
+            });
+        }
         if self.hdr {
             let linear_color = u32::from(linear);
             for buffer in [
@@ -561,10 +688,17 @@ impl Renderer {
                     core::mem::offset_of!(Config, linear_color) as u64,
                     bytemuck::bytes_of(&linear_color),
                 );
+                self.programs
+                    .diagnostics
+                    .buffer_write(BufferKind::Config, size_of_val(&linear_color) as u64);
             }
         }
+        self.programs
+            .diagnostics
+            .end_timer(started, |cpu| &mut cpu.resource_preparation);
+        let started = self.programs.diagnostics.start_timer();
         if clear {
-            Self::clear_view(encoder, view);
+            Self::clear_view(encoder, view, &mut self.programs.diagnostics);
         }
         let mut ctx = RendererContext {
             programs: &mut self.programs,
@@ -586,6 +720,9 @@ impl Renderer {
         )
         .unwrap_or_else(|error| match error {});
 
+        self.programs
+            .diagnostics
+            .end_timer(started, |cpu| &mut cpu.pass_recording);
         self.gradient_cache.maintain();
 
         Ok(())
@@ -593,9 +730,11 @@ impl Renderer {
 
     /// Clear the view to transparent black.
     // TODO: Investigate adding tests for the clear_view behavior.
-    fn clear_view(encoder: &mut CommandEncoder, view: &TextureView) {
+    fn clear_view(encoder: &mut CommandEncoder, view: &TextureView, diagnostics: &mut Diagnostics) {
+        let timestamp_writes = diagnostics.pass(PassKind::RootClear);
         encoder.begin_render_pass(&RenderPassDescriptor {
             label: Some("Clear View"),
+            timestamp_writes,
             color_attachments: &[Some(RenderPassColorAttachment {
                 view,
                 resolve_target: None,
@@ -607,7 +746,6 @@ impl Renderer {
             })],
             depth_stencil_attachment: None,
             occlusion_query_set: None,
-            timestamp_writes: None,
             multiview_mask: None,
         });
     }
@@ -683,6 +821,10 @@ impl Renderer {
         let offset = offset_override.unwrap_or(image_resource.offset);
         let atlas_texture =
             &self.programs.resources.atlas_textures[image_resource.atlas_id.as_u32() as usize];
+        self.programs.diagnostics.update(|report| {
+            report.atlas_image_writes += 1;
+            report.atlas_image_pixels += u64::from(writer.width()) * u64::from(writer.height());
+        });
         writer.write_to_atlas(
             device,
             queue,
@@ -740,6 +882,7 @@ impl Renderer {
 
         let mut render_pass = encoder.begin_render_pass(&RenderPassDescriptor {
             label: Some("Clear Atlas Region"),
+            timestamp_writes: self.programs.diagnostics.pass(PassKind::AtlasClear),
             color_attachments: &[Some(RenderPassColorAttachment {
                 view: &layer_view,
                 resolve_target: None,
@@ -752,7 +895,6 @@ impl Renderer {
             })],
             depth_stencil_attachment: None,
             occlusion_query_set: None,
-            timestamp_writes: None,
             multiview_mask: None,
         });
 
@@ -980,6 +1122,10 @@ fn clear_atlas_region(queue: &Queue, renderer: &mut Renderer, rect: &PendingClea
     // TODO: Can we optimize this more?
     let byte_count = rect.width as usize * rect.height as usize * 4;
     renderer.atlas_clear_scratch.resize(byte_count, 0);
+    renderer.programs.diagnostics.update(|report| {
+        report.atlas_clear_writes += 1;
+        report.atlas_clear_bytes += byte_count as u64;
+    });
     queue.write_texture(
         wgpu::TexelCopyTextureInfo {
             texture: renderer.atlas_texture(AtlasId::new(rect.page_index)),
@@ -1008,6 +1154,7 @@ fn clear_atlas_region(queue: &Queue, renderer: &mut Renderer, rect: &PendingClea
 /// Defines the GPU resources and pipelines for rendering.
 #[derive(Debug)]
 struct Programs {
+    diagnostics: Diagnostics,
     intermediate_format: wgpu::TextureFormat,
     atlas_strip_pipeline: RenderPipeline,
     /// Intermediate strip pipeline.
@@ -1830,6 +1977,7 @@ impl Programs {
         };
 
         Self {
+            diagnostics: Diagnostics::default(),
             intermediate_format,
             atlas_strip_pipeline,
             intermediate_strip_pipeline,
@@ -1913,6 +2061,11 @@ impl Programs {
                 u32::from(texture_size.height()),
                 self.resources.resource_texture_dimension_2d,
             );
+            self.diagnostics.buffer(
+                BufferKind::Config,
+                &self.resources.layer_config_buffer,
+                SIZE_OF_CONFIG.get(),
+            );
         }
 
         for (index, textures) in self.resources.layer_textures.iter_mut().enumerate() {
@@ -1960,6 +2113,22 @@ impl Programs {
         if scratch_changed {
             self.update_scratch_bind_groups(device);
         }
+        self.diagnostics.update(|report| {
+            let count = self
+                .resources
+                .layer_textures
+                .iter()
+                .map(|pages| pages.len() as u64)
+                .sum::<u64>()
+                + u64::from(self.resources.scratch_texture.is_some());
+            let bytes = count
+                * u64::from(texture_size.width())
+                * u64::from(texture_size.height())
+                * u64::from(self.intermediate_format.block_copy_size(None).unwrap());
+            report.max_intermediate_textures = report.max_intermediate_textures.max(count);
+            report.max_intermediate_capacity_bytes =
+                report.max_intermediate_capacity_bytes.max(bytes);
+        });
     }
 
     fn clear_layer_bind_group_caches(&mut self) {
@@ -1969,6 +2138,8 @@ impl Programs {
     }
 
     fn update_scratch_bind_groups(&mut self, device: &Device) {
+        self.diagnostics.bind_groups(BindGroupKind::Filter, 1);
+        self.diagnostics.bind_groups(BindGroupKind::Copy, 1);
         let scratch_view = self.resources.scratch_view();
         let filter_original_bind_group = create_filter_original_texture_bind_group(
             device,
@@ -2290,6 +2461,26 @@ impl Programs {
             self.upload_gradient_texture(queue, gradient_cache);
             gradient_cache.mark_synced();
         }
+        self.diagnostics.data(
+            UploadKind::Alpha,
+            alphas.len() as u64,
+            &self.resources.alphas_texture,
+        );
+        self.diagnostics.data(
+            UploadKind::Paint,
+            u64::from(*paint_idxs.last().unwrap()) * 16,
+            &self.resources.encoded_paints_texture,
+        );
+        self.diagnostics.data(
+            UploadKind::Filter,
+            u64::from(filter_context.total_texels()) * 16,
+            &self.resources.filter_data_texture,
+        );
+        self.diagnostics.data(
+            UploadKind::Gradient,
+            gradient_cache.luts_size() as u64,
+            &self.resources.gradient_texture,
+        );
     }
 
     fn maybe_resize_filter_tex(
@@ -2319,6 +2510,7 @@ impl Programs {
                 required_filter_height,
             );
             self.resources.filter_data_texture = filter_texture;
+            self.diagnostics.bind_groups(BindGroupKind::Filter, 1);
             self.resources.filter_base_bind_group = Self::create_filter_base_bind_group(
                 device,
                 &self.filter_bind_group_layout,
@@ -2397,6 +2589,7 @@ impl Programs {
             self.resources.encoded_paints_texture = encoded_paints_texture;
 
             // Since the encoded paints texture has changed, we need to update the strip bind groups.
+            self.diagnostics.bind_groups(BindGroupKind::Paint, 1);
             self.resources.encoded_paints_bind_group = Self::create_encoded_paints_bind_group(
                 device,
                 &self.encoded_paints_bind_group_layout,
@@ -2436,6 +2629,7 @@ impl Programs {
             self.resources.gradient_texture = gradient_texture;
 
             // Since the gradient texture has changed, we need to update the gradient bind group.
+            self.diagnostics.bind_groups(BindGroupKind::Gradient, 1);
             self.resources.gradient_bind_group = Self::create_gradient_bind_group(
                 device,
                 &self.gradient_bind_group_layout,
@@ -2471,6 +2665,8 @@ impl Programs {
                 .write_buffer_with(&self.resources.view_config_buffer, 0, SIZE_OF_CONFIG)
                 .expect("Buffer only ever holds `Config`");
             buffer.copy_from_slice(bytemuck::bytes_of(&config));
+            self.diagnostics
+                .buffer_write(BufferKind::Config, SIZE_OF_CONFIG.get());
 
             self.render_size = new_render_size.clone();
         }
@@ -2517,6 +2713,8 @@ impl Programs {
 
         // Temporarily pad the length of the alphas to the texture size before uploading.
         alphas.resize(total_size, 0);
+        self.diagnostics
+            .upload(UploadKind::Alpha, total_size as u64);
 
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
@@ -2551,6 +2749,10 @@ impl Programs {
         let encoded_paints_texture_height = encoded_paints_texture.height();
 
         GpuEncodedPaint::serialize_to_buffer(encoded_paints, &mut self.encoded_paints_data);
+        self.diagnostics.upload(
+            UploadKind::Paint,
+            u64::from(encoded_paints_texture_width) * u64::from(encoded_paints_texture_height) * 16,
+        );
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: encoded_paints_texture,
@@ -2583,6 +2785,10 @@ impl Programs {
         let height = filter_texture.height();
 
         filter_context.serialize_to_buffer(&mut self.filter_data);
+        self.diagnostics.upload(
+            UploadKind::Filter,
+            u64::from(width) * u64::from(height) * 16,
+        );
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: filter_texture,
@@ -2620,6 +2826,8 @@ impl Programs {
             let mut luts = gradient_cache.take_luts();
             let old_luts_len = luts.len();
             luts.resize(total_capacity, 0);
+            self.diagnostics
+                .upload(UploadKind::Gradient, total_capacity as u64);
 
             queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
@@ -2659,6 +2867,9 @@ impl Programs {
         let alpha_len = (alpha_strips.len() * size_of::<GpuStrip>()) as u64;
         let total_len = opaque_len + alpha_len;
         self.resources.strips_buffer = Self::create_strips_buffer(device, total_len);
+        self.diagnostics
+            .buffer(BufferKind::Strip, &self.resources.strips_buffer, 0);
+        self.diagnostics.buffer_write(BufferKind::Strip, total_len);
         // TODO: Consider using a staging belt to avoid an extra staging buffer allocation.
         let mut buffer_view = queue
             .write_buffer_with(
@@ -2717,6 +2928,9 @@ impl RendererContext<'_> {
                         .clone(),
                     None => placeholder.clone(),
                 });
+                self.programs
+                    .diagnostics
+                    .bind_groups(BindGroupKind::Image, 1);
                 let bind_group = self
                     .programs
                     .create_run_external_texture_bind_group(self.device, texture_views.each_ref());
@@ -2779,6 +2993,9 @@ impl RendererContext<'_> {
                 .resources
                 .alphas_texture
                 .create_view(&TextureViewDescriptor::default());
+            self.programs
+                .diagnostics
+                .bind_groups(BindGroupKind::Strip, 1);
             let bind_group = Programs::create_strip_bind_group(
                 self.device,
                 &self.programs.strip_bind_group_layout,
@@ -2818,6 +3035,11 @@ impl RendererContext<'_> {
 
         let mut render_pass = self.encoder.begin_render_pass(&RenderPassDescriptor {
             label: Some("Render to Texture Pass"),
+            timestamp_writes: self.programs.diagnostics.pass(match target {
+                DrawPassTarget::Root(RootTarget::UserSurface) => PassKind::RootStrip,
+                DrawPassTarget::Root(RootTarget::AtlasLayer) => PassKind::AtlasStrip,
+                DrawPassTarget::Layer(_) => PassKind::LayerStrip,
+            }),
             color_attachments: &[Some(RenderPassColorAttachment {
                 view,
                 depth_slice: None,
@@ -2829,7 +3051,6 @@ impl RendererContext<'_> {
             })],
             depth_stencil_attachment,
             occlusion_query_set: None,
-            timestamp_writes: None,
             multiview_mask: None,
         });
         render_pass.set_bind_group(0, bind_group, &[]);
@@ -2913,6 +3134,9 @@ impl RendererContext<'_> {
                 let alphas_texture_view = resources
                     .alphas_texture
                     .create_view(&TextureViewDescriptor::default());
+                self.programs
+                    .diagnostics
+                    .bind_groups(BindGroupKind::Blend, 1);
                 entry.insert(Programs::create_blend_layer_bind_group(
                     self.device,
                     &self.programs.blend_layer_bind_group_layout,
@@ -2951,10 +3175,16 @@ impl RendererContext<'_> {
                 contents: bytemuck::cast_slice(&self.scratch_buffers.blend_instances),
                 usage: wgpu::BufferUsages::VERTEX,
             });
+        self.programs.diagnostics.buffer(
+            BufferKind::Blend,
+            &instance_buffer,
+            size_of_val(self.scratch_buffers.blend_instances.as_slice()) as u64,
+        );
 
         {
             let mut render_pass = self.encoder.begin_render_pass(&RenderPassDescriptor {
                 label: Some("Blend To Scratch"),
+                timestamp_writes: self.programs.diagnostics.pass(PassKind::Blend),
                 color_attachments: &[Some(RenderPassColorAttachment {
                     view: self.programs.resources.scratch_view(),
                     depth_slice: None,
@@ -2966,7 +3196,6 @@ impl RendererContext<'_> {
                 })],
                 depth_stencil_attachment: None,
                 occlusion_query_set: None,
-                timestamp_writes: None,
                 multiview_mask: None,
             });
             render_pass.set_pipeline(&self.programs.blend_pipeline);
@@ -2991,6 +3220,8 @@ impl RendererContext<'_> {
             &self.programs.resources.scratch_copy_bind_group,
             self.programs.resources.layer_view(bindings.target()),
             "Copy Blend Scratch To Layer",
+            &mut self.programs.diagnostics,
+            PassKind::BlendCopy,
         );
     }
 
@@ -3008,6 +3239,12 @@ impl RendererContext<'_> {
                 TextureParity::Odd => [temporary, target],
             };
             let layer_views = resources.layer_views(layer_ids);
+            self.programs
+                .diagnostics
+                .bind_groups(BindGroupKind::Filter, 2);
+            self.programs
+                .diagnostics
+                .bind_groups(BindGroupKind::Copy, 1);
             let inputs = layer_views.map(|view| {
                 create_filter_input_bind_group(
                     self.device,
@@ -3040,6 +3277,8 @@ impl RendererContext<'_> {
                 &filter_pair_bind_groups.copy_source,
                 resources.scratch_view(),
                 "Filter Copy Pass",
+                &mut self.programs.diagnostics,
+                PassKind::FilterCopy,
             );
         }
 
@@ -3055,6 +3294,7 @@ impl RendererContext<'_> {
                 &filter_pair_bind_groups.inputs[input.texture_parity.get_parity()],
                 &resources.filter_original_bind_group,
                 output,
+                &mut self.programs.diagnostics,
             );
         }
     }
@@ -3081,9 +3321,15 @@ impl RendererContext<'_> {
                 contents: bytemuck::cast_slice(&self.scratch_buffers.clear_instances),
                 usage: wgpu::BufferUsages::VERTEX,
             });
+        self.programs.diagnostics.buffer(
+            BufferKind::Clear,
+            &clear_buffer,
+            size_of_val(self.scratch_buffers.clear_instances.as_slice()) as u64,
+        );
         let view = self.programs.resources.layer_view(target);
         let mut render_pass = self.encoder.begin_render_pass(&RenderPassDescriptor {
             label: Some("Clear Rects"),
+            timestamp_writes: self.programs.diagnostics.pass(PassKind::LayerClear),
             color_attachments: &[Some(RenderPassColorAttachment {
                 view,
                 depth_slice: None,
@@ -3095,7 +3341,6 @@ impl RendererContext<'_> {
             })],
             depth_stencil_attachment: None,
             occlusion_query_set: None,
-            timestamp_writes: None,
             multiview_mask: None,
         });
         render_pass.set_pipeline(&self.programs.clear_pipeline);
@@ -3179,14 +3424,22 @@ fn encode_copy_pass(
     source_bind_group: &BindGroup,
     output_view: &TextureView,
     label: &'static str,
+    diagnostics: &mut Diagnostics,
+    kind: PassKind,
 ) {
     let instance_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some(label),
         contents: bytemuck::cast_slice(instances),
         usage: wgpu::BufferUsages::VERTEX,
     });
+    diagnostics.buffer(
+        BufferKind::Copy,
+        &instance_buffer,
+        size_of_val(instances) as u64,
+    );
     let mut render_pass = encoder.begin_render_pass(&RenderPassDescriptor {
         label: Some(label),
+        timestamp_writes: diagnostics.pass(kind),
         color_attachments: &[Some(RenderPassColorAttachment {
             view: output_view,
             depth_slice: None,
@@ -3198,7 +3451,6 @@ fn encode_copy_pass(
         })],
         depth_stencil_attachment: None,
         occlusion_query_set: None,
-        timestamp_writes: None,
         multiview_mask: None,
     });
     render_pass.set_pipeline(copy_pipeline);
@@ -3216,6 +3468,7 @@ fn encode_filter_pass(
     input_bind_group: &BindGroup,
     original_texture_bind_group: &BindGroup,
     output: LayerTextureId,
+    diagnostics: &mut Diagnostics,
 ) {
     let output_view = resources.layer_view(output);
     let instance_count = u32::try_from(instances.len()).unwrap();
@@ -3225,8 +3478,14 @@ fn encode_filter_pass(
         usage: wgpu::BufferUsages::VERTEX,
     });
 
+    diagnostics.buffer(
+        BufferKind::Filter,
+        &instance_buffer,
+        size_of_val(instances) as u64,
+    );
     let mut render_pass = encoder.begin_render_pass(&RenderPassDescriptor {
         label: Some("Apply Filter Pass"),
+        timestamp_writes: diagnostics.pass(PassKind::Filter),
         color_attachments: &[Some(RenderPassColorAttachment {
             view: output_view,
             depth_slice: None,
@@ -3238,7 +3497,6 @@ fn encode_filter_pass(
         })],
         depth_stencil_attachment: None,
         occlusion_query_set: None,
-        timestamp_writes: None,
         multiview_mask: None,
     });
     render_pass.set_pipeline(filter_pipeline);

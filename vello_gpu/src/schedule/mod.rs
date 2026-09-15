@@ -205,6 +205,10 @@ impl Schedule {
         Ok(schedule)
     }
 
+    pub(crate) fn round_count(&self) -> usize {
+        self.rounds.rounds.len()
+    }
+
     pub(crate) fn intermediate_texture_requirements(&self) -> IntermediateTextureRequirements {
         self.intermediate_textures
     }
