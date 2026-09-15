@@ -581,6 +581,20 @@ impl Tiles {
             let p1_x = line.p1.x / f32::from(Tile::WIDTH);
             let p1_y = line.p1.y / f32::from(Tile::HEIGHT);
 
+            if p0_x >= 0.0 && p0_y >= 0.0 && p1_x >= 0.0 && p1_y >= 0.0 {
+                let x = p0_x as u16;
+                let y = p0_y as u16;
+                if x < tile_columns && y < tile_rows && x == p1_x as u16 && y == p1_y as u16 {
+                    // Horizontal lines exactly on a tile-row boundary contribute no winding.
+                    if p0_y.max(p1_y) > f32::from(y) {
+                        let winding = ((p0_y.min(p1_y) <= f32::from(y)) as u32) << WINDING_SHIFT;
+                        self.tile_buf
+                            .push(Tile::new_clamped(x, y, line_idx, winding));
+                    }
+                    continue;
+                }
+            }
+
             let (line_left_x, line_right_x) = if p0_x < p1_x {
                 (p0_x, p1_x)
             } else {
