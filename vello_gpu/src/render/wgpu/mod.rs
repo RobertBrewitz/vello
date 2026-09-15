@@ -697,7 +697,15 @@ impl Renderer {
             .diagnostics
             .end_timer(started, |cpu| &mut cpu.resource_preparation);
         let started = self.programs.diagnostics.start_timer();
-        if clear {
+        // Defer initialization only when no layer or destination blend can read the
+        // root before its first strip pass. Closed layers must also be excluded.
+        let pending_root_clear = clear
+            && root_output_target == RootTarget::UserSurface
+            && depth_view.is_none()
+            && scene.recorder.layers.is_empty()
+            && !scene.recorder.root_is_blend_target
+            && !scene.recorder.has_non_default_blend;
+        if clear && !pending_root_clear {
             Self::clear_view(encoder, view, &mut self.programs.diagnostics);
         }
         let mut ctx = RendererContext {
@@ -710,6 +718,7 @@ impl Renderer {
             texture_bindings,
             external_texture_bind_groups: HashMap::new(),
             scratch_buffers: &mut self.scratch_buffers,
+            pending_root_clear,
         };
 
         crate::schedule::execute(
@@ -719,6 +728,10 @@ impl Renderer {
             root_output_target,
         )
         .unwrap_or_else(|error| match error {});
+
+        if ctx.pending_root_clear {
+            Self::clear_view(ctx.encoder, ctx.view, &mut ctx.programs.diagnostics);
+        }
 
         self.programs
             .diagnostics
@@ -2849,6 +2862,7 @@ struct RendererContext<'a> {
     texture_bindings: &'a TextureBindings,
     external_texture_bind_groups: HashMap<ExternalTextureBindings, BindGroup>,
     scratch_buffers: &'a mut ScratchBuffers,
+    pending_root_clear: bool,
 }
 
 impl RendererContext<'_> {
@@ -2978,6 +2992,13 @@ impl RendererContext<'_> {
             None
         };
 
+        let color_load = if matches!(target, DrawPassTarget::Root(RootTarget::UserSurface))
+            && core::mem::take(&mut self.pending_root_clear)
+        {
+            wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT)
+        } else {
+            wgpu::LoadOp::Load
+        };
         let mut render_pass = self.encoder.begin_render_pass(&RenderPassDescriptor {
             label: Some("Render to Texture Pass"),
             timestamp_writes: self.programs.diagnostics.pass(match target {
@@ -2990,7 +3011,7 @@ impl RendererContext<'_> {
                 depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Load,
+                    load: color_load,
                     store: wgpu::StoreOp::Store,
                 },
             })],
