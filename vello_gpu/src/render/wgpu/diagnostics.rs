@@ -89,7 +89,7 @@ impl RenderUploadKind {
     pub const COUNT: usize = 4;
 }
 
-/// Byte sums are observations per scene preparation, not unique resident allocations.
+/// Byte sums are observations per scene/group preparation, not unique resident allocations.
 /// Upload bytes are requested texel bytes, excluding opaque wgpu/driver staging padding.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct UploadDiagnostics {
@@ -114,7 +114,8 @@ pub struct AlphaDiagnostics {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RenderCpuTimings {
-    /// Inclusive public render time, including nested atlas work and resource maintenance.
+    /// Renderer CPU time, including grouped preparation/draws and nested atlas work.
+    /// Caller composition between grouped draws is excluded.
     pub render: Duration,
     pub paint_preparation: Duration,
     pub scheduling: Duration,

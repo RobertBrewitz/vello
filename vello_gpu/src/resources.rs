@@ -44,7 +44,7 @@ pub struct CacheDiagnostics {
     pub outline_evictions: u64,
     /// Maintenance calls, normally one per explicit resource frame.
     pub maintenance_calls: u64,
-    /// Render calls reaching glyph resource preparation, excluding atlas raster passes.
+    /// Scene preparations using glyph resources, excluding atlas raster passes.
     pub render_calls: u64,
     /// Passes that rasterized new glyphs into an atlas, not glyph count.
     pub atlas_raster_passes: u64,

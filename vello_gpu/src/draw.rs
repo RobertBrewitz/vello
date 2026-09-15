@@ -394,6 +394,13 @@ impl<T: DrawTarget> DrawState<T> {
 const RECT_STRIP_FLAG: u32 = 1 << 31;
 
 impl GpuStrip {
+    pub(crate) fn offset_alpha_columns(&mut self, offset: u32) {
+        // Rectangles store edge fractions here, and solid strips have no coverage index.
+        if self.paint_and_rect_flag & RECT_STRIP_FLAG == 0 && self.dense_width_or_rect_height != 0 {
+            self.col_idx_or_rect_frac = self.col_idx_or_rect_frac.checked_add(offset).unwrap();
+        }
+    }
+
     fn from_fill_segment(
         rect: RectU16,
         col_idx: Option<u32>,

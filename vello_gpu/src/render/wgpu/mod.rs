@@ -19,6 +19,9 @@ only break in edge cases, and some of them are also only related to conversions 
 )]
 
 pub mod diagnostics;
+mod group;
+
+pub use group::{MAX_FLAT_GROUP_SCENES, PreparedFlatGroup};
 
 use crate::draw::{EXTERNAL_TEXTURE_SLOT_COUNT, ExternalTextureBindings, ExternalTextureRun};
 use crate::render::common::IMAGE_PADDING;
@@ -400,35 +403,7 @@ impl Renderer {
             }
         }
         #[cfg(feature = "text")]
-        {
-            resources.before_render(
-                self,
-                |renderer, glyph_renderer, atlas_count, atlas_config, atlas_id| {
-                    renderer
-                        .render_to_atlas(
-                            glyph_renderer,
-                            atlas_count,
-                            atlas_config,
-                            device,
-                            queue,
-                            atlas_id,
-                            texture_bindings,
-                        )
-                        .expect("Failed to render glyphs to atlas");
-                },
-                |renderer, image_cache, upload, dst_x, dst_y| {
-                    renderer.write_to_atlas(
-                        image_cache,
-                        device,
-                        queue,
-                        encoder,
-                        upload.image_id,
-                        &upload.pixmap,
-                        Some([dst_x, dst_y]),
-                    );
-                },
-            );
-        }
+        self.prepare_glyphs(resources, device, queue, encoder, texture_bindings);
 
         let result = self.render_scene(
             scene,
@@ -450,6 +425,44 @@ impl Renderer {
             clear_atlas_region(queue, renderer, rect);
         });
         result
+    }
+
+    #[cfg(feature = "text")]
+    fn prepare_glyphs(
+        &mut self,
+        resources: &mut Resources,
+        device: &Device,
+        queue: &Queue,
+        encoder: &mut CommandEncoder,
+        texture_bindings: &TextureBindings,
+    ) {
+        resources.before_render(
+            self,
+            |renderer, glyph_renderer, atlas_count, atlas_config, atlas_id| {
+                renderer
+                    .render_to_atlas(
+                        glyph_renderer,
+                        atlas_count,
+                        atlas_config,
+                        device,
+                        queue,
+                        atlas_id,
+                        texture_bindings,
+                    )
+                    .expect("Failed to render glyphs to atlas");
+            },
+            |renderer, image_cache, upload, dst_x, dst_y| {
+                renderer.write_to_atlas(
+                    image_cache,
+                    device,
+                    queue,
+                    encoder,
+                    upload.image_id,
+                    &upload.pixmap,
+                    Some([dst_x, dst_y]),
+                );
+            },
+        );
     }
 
     /// Ends an explicit resource frame and advances glyph eviction once.
@@ -704,6 +717,7 @@ impl Renderer {
             external_texture_bind_groups: HashMap::new(),
             scratch_buffers: &mut self.scratch_buffers,
             pending_root_clear,
+            uploaded_strips: None,
         };
 
         crate::schedule::execute(
@@ -1210,6 +1224,7 @@ struct Programs {
     texture_upload_scratch: Vec<u8>,
     image_bind_groups: HashMap<[TextureView; EXTERNAL_TEXTURE_SLOT_COUNT], BindGroup>,
     image_bind_group_order: VecDeque<[TextureView; EXTERNAL_TEXTURE_SLOT_COUNT]>,
+    flat_group: group::FlatGroupStorage,
 }
 
 /// Contains all GPU resources needed for rendering
@@ -1994,6 +2009,7 @@ impl Programs {
             texture_upload_scratch: Vec::new(),
             image_bind_groups: HashMap::new(),
             image_bind_group_order: VecDeque::new(),
+            flat_group: group::FlatGroupStorage::default(),
             render_size: RenderSize {
                 width: render_target_config.width,
                 height: render_target_config.height,
@@ -2898,6 +2914,7 @@ struct RendererContext<'a> {
     external_texture_bind_groups: HashMap<ExternalTextureBindings, BindGroup>,
     scratch_buffers: &'a mut ScratchBuffers,
     pending_root_clear: bool,
+    uploaded_strips: Option<wgpu::BufferSlice<'a>>,
 }
 
 impl RendererContext<'_> {
@@ -2945,15 +2962,15 @@ impl RendererContext<'_> {
         if opaque_count == 0 && alpha_count == 0 {
             return;
         }
-        // TODO: We currently allocate a new strips buffer for each render pass. A more efficient
-        // approach would be to re-use buffers or slices of a larger buffer.
         // Create bind groups for all external textures used by this pass.
         for run in external_texture_runs {
             self.external_texture_bind_group_for_textures(run.bindings);
         }
 
-        self.programs
-            .upload_strip_pair(self.device, self.queue, opaque_strips, alpha_strips);
+        if self.uploaded_strips.is_none() {
+            self.programs
+                .upload_strip_pair(self.device, self.queue, opaque_strips, alpha_strips);
+        }
         let opaque_count = opaque_count as u32;
         let alpha_count = alpha_count as u32;
 
@@ -3054,7 +3071,12 @@ impl RendererContext<'_> {
         render_pass.set_bind_group(0, bind_group, &[]);
         render_pass.set_bind_group(2, &self.programs.resources.encoded_paints_bind_group, &[]);
         render_pass.set_bind_group(3, &self.programs.resources.gradient_bind_group, &[]);
-        render_pass.set_vertex_buffer(0, self.programs.resources.strips_buffer.slice(..));
+        render_pass.set_vertex_buffer(
+            0,
+            self.uploaded_strips
+                .take()
+                .unwrap_or_else(|| self.programs.resources.strips_buffer.slice(..)),
+        );
 
         let draw_strip_runs = |render_pass: &mut wgpu::RenderPass<'_>, first_instance, count| {
             if external_texture_runs.is_empty() {
