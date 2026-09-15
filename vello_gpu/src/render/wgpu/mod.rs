@@ -677,22 +677,7 @@ impl Renderer {
                 stats.max_capacity_after_bytes = stats.max_capacity_after_bytes.max(after);
             });
         }
-        if self.hdr {
-            let linear_color = u32::from(linear);
-            for buffer in [
-                &self.programs.resources.view_config_buffer,
-                &self.programs.resources.layer_config_buffer,
-            ] {
-                queue.write_buffer(
-                    buffer,
-                    core::mem::offset_of!(Config, linear_color) as u64,
-                    bytemuck::bytes_of(&linear_color),
-                );
-                self.programs
-                    .diagnostics
-                    .buffer_write(BufferKind::Config, size_of_val(&linear_color) as u64);
-            }
-        }
+        self.programs.update_config_color(queue, u32::from(linear));
         self.programs
             .diagnostics
             .end_timer(started, |cpu| &mut cpu.resource_preparation);
@@ -1260,8 +1245,10 @@ struct GpuResources {
     texture_size: SizeU16,
     /// Root config buffer.
     view_config_buffer: Buffer,
+    view_config_linear_color: u32,
     /// Layer config buffer.
     layer_config_buffer: Buffer,
+    layer_config_linear_color: u32,
 
     /// Layer textures by parity.
     layer_textures: [Vec<TextureView>; 2],
@@ -1963,6 +1950,7 @@ impl Programs {
             filter_original_bind_group,
             scratch_copy_bind_group,
             layer_config_buffer,
+            layer_config_linear_color: 0,
             alphas_texture,
             resource_texture_dimension_2d,
             atlas_textures,
@@ -1978,6 +1966,7 @@ impl Programs {
             filter_base_bind_group,
             texture_size,
             view_config_buffer,
+            view_config_linear_color: 0,
         };
 
         Self {
@@ -2066,6 +2055,7 @@ impl Programs {
                 u32::from(texture_size.height()),
                 self.resources.resource_texture_dimension_2d,
             );
+            self.resources.layer_config_linear_color = 0;
             self.diagnostics.buffer(
                 BufferKind::Config,
                 &self.resources.layer_config_buffer,
@@ -2638,6 +2628,31 @@ impl Programs {
         }
     }
 
+    fn update_config_color(&mut self, queue: &Queue, linear_color: u32) {
+        for (buffer, current) in [
+            (
+                &self.resources.view_config_buffer,
+                &mut self.resources.view_config_linear_color,
+            ),
+            (
+                &self.resources.layer_config_buffer,
+                &mut self.resources.layer_config_linear_color,
+            ),
+        ] {
+            if *current == linear_color {
+                continue;
+            }
+            queue.write_buffer(
+                buffer,
+                core::mem::offset_of!(Config, linear_color) as u64,
+                bytemuck::bytes_of(&linear_color),
+            );
+            self.diagnostics
+                .buffer_write(BufferKind::Config, size_of_val(&linear_color) as u64);
+            *current = linear_color;
+        }
+    }
+
     /// Update config buffer if dimensions changed.
     fn maybe_update_config_buffer(
         &mut self,
@@ -2655,7 +2670,7 @@ impl Programs {
                 strip_offset_x: 0,
                 strip_offset_y: 0,
                 negate_ndc: 0,
-                linear_color: 0,
+                linear_color: self.resources.view_config_linear_color,
                 _padding: [0; 3],
             };
             let mut buffer = queue
