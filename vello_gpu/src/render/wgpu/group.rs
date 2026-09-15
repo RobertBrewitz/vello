@@ -25,7 +25,6 @@ pub enum RadianceRoute {
 
 #[derive(Debug, Default)]
 pub(super) struct FlatGroupStorage {
-    alphas: Vec<u8>,
     paints: Vec<GpuEncodedPaint>,
     buffers: DrawBuffers,
     draws: Vec<Draw>,
@@ -36,7 +35,6 @@ pub(super) struct FlatGroupStorage {
 
 impl FlatGroupStorage {
     fn clear(&mut self) {
-        self.alphas.clear();
         self.paints.clear();
         self.buffers.clear();
         for draw in &mut self.draws {
@@ -456,7 +454,7 @@ impl Renderer {
             if strips > MAX_GROUP_STRIPS {
                 break;
             }
-            let alpha_bytes = scene.strip_storage.borrow().alphas.len().div_ceil(16) * 16;
+            let alpha_bytes = AlphaData::segment_len(&scene.strip_storage.borrow().alphas);
             let gradient_count = scene
                 .encoded_paints
                 .iter()
@@ -494,6 +492,16 @@ impl Renderer {
         storage
             .draws
             .resize_with(storage.draws.len().max(scenes.len()), Draw::default);
+        assert!(scenes.len() <= MAX_FLAT_GROUP_SCENES);
+        let alpha_storage: [_; MAX_FLAT_GROUP_SCENES] = core::array::from_fn(|index| {
+            scenes.get(index).map(|scene| scene.strip_storage.borrow())
+        });
+        let alpha_segments = alpha_storage.each_ref().map(|storage| {
+            storage
+                .as_ref()
+                .map_or(&[][..], |storage| storage.alphas.as_slice())
+        });
+        let mut alpha_bytes = 0_usize;
         let mut paint_texels = 0;
         for (index, scene) in scenes.iter().enumerate() {
             if let Some(radiance_view) = radiance_view {
@@ -526,12 +534,10 @@ impl Renderer {
             storage.paints.append(&mut self.encoded_paints);
             let started = self.programs.diagnostics.start_timer();
             let strip_storage = scene.strip_storage.borrow();
-            let alpha_offset =
-                u32::try_from(storage.alphas.len() / usize::from(Tile::HEIGHT)).unwrap();
-            storage.alphas.extend_from_slice(&strip_storage.alphas);
-            storage
-                .alphas
-                .resize(storage.alphas.len().div_ceil(16) * 16, 0);
+            let alpha_offset = u32::try_from(alpha_bytes / usize::from(Tile::HEIGHT)).unwrap();
+            alpha_bytes = alpha_bytes
+                .checked_add(AlphaData::segment_len(alpha_segments[index]))
+                .expect("group alpha size overflow");
             self.programs.diagnostics.update(|report| {
                 let stats = &mut report.scene_alphas;
                 let capacity = strip_storage.alphas.capacity() as u64;
@@ -579,7 +585,7 @@ impl Renderer {
             queue,
             &mut self.gradient_cache,
             &storage.paints,
-            &storage.alphas,
+            AlphaData::Segmented(&alpha_segments[..scenes.len()]),
             render_size,
             &[paint_texels],
             &FilterContext::default(),

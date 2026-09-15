@@ -18,8 +18,11 @@
 only break in edge cases, and some of them are also only related to conversions from f64 to f32."
 )]
 
+mod alpha;
 pub mod diagnostics;
 mod group;
+
+use alpha::AlphaData;
 
 pub use group::{MAX_FLAT_GROUP_SCENES, PreparedFlatGroup, RadianceRoute};
 
@@ -668,7 +671,7 @@ impl Renderer {
             queue,
             &mut self.gradient_cache,
             &self.encoded_paints,
-            &scene.strip_storage.borrow().alphas,
+            AlphaData::Contiguous(&scene.strip_storage.borrow().alphas),
             render_size,
             &self.paint_idxs,
             &self.schedule_storage.filter_context,
@@ -2482,7 +2485,7 @@ impl Programs {
         queue: &Queue,
         gradient_cache: &mut GradientRampCache,
         encoded_paints: &[GpuEncodedPaint],
-        alphas: &[u8],
+        alphas: AlphaData<'_>,
         new_render_size: &RenderSize,
         paint_idxs: &[u32],
         filter_context: &FilterContext,
@@ -2774,15 +2777,23 @@ impl Programs {
     }
 
     /// Upload alpha data to the texture.
-    fn upload_alpha_texture(&mut self, queue: &Queue, alphas: &[u8]) {
-        upload_data_texture(
-            queue,
-            &self.resources.alphas_texture,
-            alphas,
-            &mut self.texture_upload_scratch,
-            &mut self.diagnostics,
-            UploadKind::Alpha,
-        );
+    fn upload_alpha_texture(&mut self, queue: &Queue, alphas: AlphaData<'_>) {
+        match alphas {
+            AlphaData::Contiguous(data) => upload_data_texture(
+                queue,
+                &self.resources.alphas_texture,
+                data,
+                &mut self.texture_upload_scratch,
+                &mut self.diagnostics,
+                UploadKind::Alpha,
+            ),
+            AlphaData::Segmented(segments) => alpha::upload_segments(
+                queue,
+                &self.resources.alphas_texture,
+                segments,
+                &mut self.diagnostics,
+            ),
+        }
     }
 
     /// Upload encoded paints to the texture.
