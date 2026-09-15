@@ -48,10 +48,21 @@ impl SceneCase {
         f: impl FnOnce(&mut Self),
     ) {
         let clip = clip.map(|rect| rect.to_path(0.1));
-        self.scene
-            .push_layer(clip.as_ref(), blend_mode, None, None, filter);
-        f(self);
-        self.scene.pop_layer();
+        if self.scene.has_open_layers() {
+            self.scene
+                .push_layer(clip.as_ref(), blend_mode, None, None, filter);
+            f(self);
+            self.scene.pop_layer();
+        } else {
+            let mut fragment = Self::new(self.scene.width(), self.scene.height());
+            fragment
+                .scene
+                .push_layer(clip.as_ref(), blend_mode, None, None, filter);
+            f(&mut fragment);
+            fragment.scene.pop_layer();
+            let mut recording = fragment.scene.take_recording().expect("closed layer");
+            assert!(self.scene.try_append(&mut recording));
+        }
     }
 
     pub(super) fn schedule(

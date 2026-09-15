@@ -3,6 +3,8 @@
 
 //! Basic render operations.
 
+mod append;
+
 #[cfg(feature = "text")]
 use crate::Resources;
 #[cfg(feature = "text")]
@@ -978,6 +980,14 @@ mod tests {
         scene.fill_rect(&Rect::new(0.0, 0.0, 10.0, 10.0));
 
         assert_eq!(scene.recorder.draws.len(), 1);
+        let mut recording = scene.take_recording().expect("closed scene");
+        assert!(scene.recorder.draws.is_empty());
+        scene.fill_rect(&Rect::new(10.0, 0.0, 20.0, 10.0));
+        assert!(recording.try_append(&mut scene));
+        assert_eq!(recording.recorder.draws.len(), 2);
+        assert!(scene.recorder.draws.is_empty());
+        scene.fill_rect(&Rect::new(0.0, 0.0, 10.0, 10.0));
+        assert_eq!(scene.recorder.draws.len(), 1);
     }
 
     #[test]
@@ -997,6 +1007,14 @@ mod tests {
             panic!("expected a recorded rectangle");
         };
         assert_eq!(rect.rect, Rect::new(0.0, 0.0, 4.0, 8.0));
+        let mut destination = Scene::new(8, 4);
+        assert!(!destination.try_append(&mut scene));
+        assert!(destination.recorder.draws.is_empty());
+        assert_eq!(scene.recorder.draws.len(), 1);
+        destination.reset_and_resize(4, 8);
+        assert!(destination.try_append(&mut scene));
+        assert_eq!(destination.recorder.draws.len(), 1);
+        assert!(scene.recorder.draws.is_empty());
     }
 
     #[test]
