@@ -9,7 +9,7 @@
 
 use crate::filter::drop_shadow::{DropShadow, transform_shadow_params};
 use crate::filter::flood::Flood;
-use crate::filter::gaussian_blur::{GaussianBlur, transform_blur_params};
+use crate::filter::gaussian_blur::GaussianBlur;
 use crate::filter::offset::Offset;
 use crate::filter_effects::{Filter, FilterPrimitive};
 use crate::geometry::{PaddingU16, RectU16};
@@ -52,11 +52,11 @@ impl PreparedFilter {
             FilterPrimitive::GaussianBlur {
                 std_deviation,
                 edge_mode,
-            } => {
-                let scaled_std_dev = transform_blur_params(*std_deviation, transform);
-                let blur = GaussianBlur::new(scaled_std_dev, *edge_mode);
-                Self::GaussianBlur(blur)
-            }
+            } => Self::GaussianBlur(GaussianBlur::with_transform(
+                *std_deviation,
+                *edge_mode,
+                transform,
+            )),
             FilterPrimitive::DropShadow {
                 dx,
                 dy,
@@ -108,6 +108,8 @@ impl PreparedFilter {
 /// Metadata about a filter layer and how it should be composited back into the parent layer.
 #[derive(Debug, Clone, Copy)]
 pub struct FilterLayerPlacement {
+    /// Unfiltered content bounds relative to the padded pixmap, for edge sampling.
+    pub source_bounds: RectU16,
     /// The conceptual bounding box of the pixmap that needs to be allocated to render
     /// a layer correctly, including the area affected by the filter.
     ///
@@ -133,6 +135,7 @@ pub struct FilterLayerPlacement {
 
 impl FilterLayerPlacement {
     pub(crate) const EMPTY: Self = Self {
+        source_bounds: RectU16::ZERO,
         pixmap_bbox: RectU16::ZERO,
         dest_bbox: RectU16::ZERO,
         src_x: 0,
@@ -171,6 +174,7 @@ impl FilterLayerPlacement {
         let dest_bbox = pixmap_bbox.relative_to_origin((shift_x, shift_y));
 
         Self {
+            source_bounds: bbox.relative_to_origin((pixmap_bbox.x0, pixmap_bbox.y0)),
             pixmap_bbox,
             dest_bbox,
             src_x,

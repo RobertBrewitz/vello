@@ -12,6 +12,10 @@ Subheadings to categorize changes are `added, changed, deprecated, removed, fixe
 
 This release has an [MSRV][] of 1.89.
 
+### Added
+
+- Gaussian blur with independent X and Y standard deviations and affine-transformed axes. (by [@RobertBrewitz][])
+
 ## [0.2.0][] - 2026-08-07
 
 This release has an [MSRV][] of 1.88.
@@ -208,6 +212,7 @@ See also the [vello_cpu 0.0.4](../vello_cpu/CHANGELOG.md#004---2025-10-17) and [
 [@jesses-canva]: https://github.com/jesses-canva
 [@jrmoulton]: https://github.com/jrmoulton
 [@LaurenzV]: https://github.com/LaurenzV
+[@RobertBrewitz]: https://github.com/RobertBrewitz
 [@nicoburns]: https://github.com/nicoburns
 [@oscargus]: https://github.com/oscargus
 [@taj-p]: https://github.com/taj-p

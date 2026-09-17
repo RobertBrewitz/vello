@@ -277,6 +277,7 @@ mod tests {
                 Affine::IDENTITY,
             ),
             placement: FilterLayerPlacement {
+                source_bounds: RectU16::ZERO,
                 pixmap_bbox: RectU16::ZERO,
                 dest_bbox: RectU16::ZERO,
                 src_x: 0,

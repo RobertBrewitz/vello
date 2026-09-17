@@ -12,6 +12,10 @@ Subheadings to categorize changes are `added, changed, deprecated, removed, fixe
 
 This release has an [MSRV][] of 1.89.
 
+### Changed
+
+- Breaking change: `FilterPrimitive::GaussianBlur::std_deviation` now takes a `Vec2` instead of an `f32`. (by [@RobertBrewitz][])
+
 ## [0.2.0][] - 2026-08-07
 
 This release has an [MSRV][] of 1.88.
@@ -230,6 +234,7 @@ See also the [vello_cpu 0.0.1](../vello_cpu/CHANGELOG.md#001---2025-05-10) relea
 [@DJMcNab]: https://github.com/waywardmonkeys
 [@grebmeg]: https://github.com/grebmeg
 [@LaurenzV]: https://github.com/LaurenzV
+[@RobertBrewitz]: https://github.com/RobertBrewitz
 [@nicoburns]: https://github.com/nicoburns
 [@taj-p]: https://github.com/taj-p
 [@tomcur]: https://github.com/tomcur
