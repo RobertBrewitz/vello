@@ -12,6 +12,11 @@ Subheadings to categorize changes are `added, changed, deprecated, removed, fixe
 
 This release has an [MSRV][] of 1.89.
 
+### Added
+
+- `Scene::try_append` and `Scene::take_recording` for parallel CPU-side scene preparation. (by [@RobertBrewitz][])
+- `Resources::begin_frame`, `Renderer::end_frame`, and `WebGlRenderer::end_frame` to defer glyph cache maintenance across multiple renders, preventing premature eviction of glyphs referenced by scenes sharing those resources. For wgpu, submit all draws before ending the frame. (by [@RobertBrewitz][])
+
 ## [0.2.0][] - 2026-08-07
 
 This release has an [MSRV][] of 1.88.
@@ -204,6 +209,7 @@ See also the [vello_cpu 0.0.4](../vello_cpu/CHANGELOG.md#004---2025-10-17) and [
 [@DJMcNab]: https://github.com/DJMcNab
 [@b0nes164]: https://github.com/b0nes164
 [@dipeshbabu]: https://github.com/dipeshbabu
+[@RobertBrewitz]: https://github.com/RobertBrewitz
 [@grebmeg]: https://github.com/grebmeg
 [@jesses-canva]: https://github.com/jesses-canva
 [@jrmoulton]: https://github.com/jrmoulton

@@ -506,6 +506,15 @@ impl WebGlRenderer {
         Ok(())
     }
 
+    /// Finish a frame started with [`Resources::begin_frame`].
+    /// All scenes sharing these resources must be rendered before this call.
+    pub fn end_frame(&mut self, resources: &mut Resources) -> Result<(), WebGlError> {
+        resources.end_frame();
+        #[cfg(feature = "text")]
+        resources.after_render(self, clear_atlas_region)?;
+        Ok(())
+    }
+
     /// Render a `scene` directly into an atlas layer.
     ///
     /// This renders the scene's content into the specified atlas layer, which can then
