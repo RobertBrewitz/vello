@@ -34,7 +34,7 @@ impl Scene {
     }
 
     fn recording_is_closed(&self) -> bool {
-        !self.recorder.has_layers() && self.viewport_state.clip().is_none()
+        !self.has_open_layers()
     }
 
     /// Appends already rasterized scene data in painter order, then resets `other`.
@@ -189,6 +189,7 @@ impl Scene {
         append_vec(&mut target.draws, &mut source.draws);
         append_vec(&mut target.layers, &mut source.layers);
         append_vec(&mut target.filter_layers, &mut source.filter_layers);
+        target.content_bounds.union(source.content_bounds);
         target.root_is_blend_target |= source.root_is_blend_target;
         target.has_non_default_blend |= source.has_non_default_blend;
         target.max_layer_depth = target.max_layer_depth.max(source.max_layer_depth);
