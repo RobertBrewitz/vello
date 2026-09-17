@@ -15,6 +15,7 @@ This release has an [MSRV][] of 1.89.
 ### Added
 
 - `Scene::try_append` and `Scene::take_recording` for parallel CPU-side scene preparation. (by [@RobertBrewitz][])
+- `Scene::content_bounds`, `Scene::has_open_layers`, and `Scene::root_is_blend_target` for bounded composition and empty-scene skipping. (by [@RobertBrewitz][])
 
 ### Changed
 

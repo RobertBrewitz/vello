@@ -258,6 +258,36 @@ impl Scene {
         }
     }
 
+    /// Whether recording is currently inside an unclosed layer or clip path.
+    pub fn has_open_layers(&self) -> bool {
+        self.recorder.has_layers() || self.viewport_state.clip().is_some()
+    }
+
+    /// Whether a non-source-over blend targets the scene root. Such blends cannot
+    /// be preserved when this scene is rasterized separately and composited source-over.
+    /// Nest them inside an explicit normal layer to keep their destination local.
+    pub fn root_is_blend_target(&self) -> bool {
+        self.recorder.root_is_blend_target
+    }
+
+    /// Conservative output bounds in viewport pixels, including clips and filters.
+    /// Returns `None` for empty output. Bounds may be tile-aligned.
+    /// All layers and clip paths must be closed before querying the completed scene.
+    pub fn content_bounds(&self) -> Option<RectU16> {
+        assert!(
+            !self.has_open_layers(),
+            "Close scene layers and clip paths before querying bounds"
+        );
+        let viewport = RectU16::new(0, 0, self.width, self.height);
+        // Destination-dependent root blends may change pixels outside their source bounds.
+        let bounds = if self.root_is_blend_target() {
+            viewport
+        } else {
+            self.recorder.content_bounds.intersect(viewport)
+        };
+        (!bounds.is_empty()).then_some(bounds)
+    }
+
     fn active_rect(&self) -> Rect {
         Rect::new(
             0.0,
