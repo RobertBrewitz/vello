@@ -3,6 +3,8 @@
 
 //! Basic render operations.
 
+mod append;
+
 #[cfg(feature = "text")]
 use crate::Resources;
 #[cfg(feature = "text")]

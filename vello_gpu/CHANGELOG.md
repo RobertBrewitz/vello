@@ -15,6 +15,7 @@ This release has an [MSRV][] of 1.89.
 ### Added
 
 - `Scene::try_append` and `Scene::take_recording` for parallel CPU-side scene preparation. (by [@RobertBrewitz][])
+- `Resources::begin_frame`, `Renderer::end_frame`, and `WebGlRenderer::end_frame` to defer glyph cache maintenance across multiple renders, preventing premature eviction of glyphs referenced by scenes sharing those resources. For wgpu, submit all draws before ending the frame. (by [@RobertBrewitz][])
 
 ### Changed
 

@@ -133,6 +133,9 @@ impl Resources {
         backend: &mut T,
         mut clear_rect: impl FnMut(&mut T, &PendingClearRect) -> Result<(), E>,
     ) -> Result<(), E> {
+        if self.frame_active {
+            return Ok(());
+        }
         self.glyph_prep_cache.maintain();
         if let Some(glyph_resources) = self.glyph_resources.as_mut() {
             glyph_resources.maintain(&mut self.image_cache);
