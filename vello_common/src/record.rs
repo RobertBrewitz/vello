@@ -172,6 +172,8 @@ impl RecordedLayer {
 pub struct CommandRecorder<D> {
     /// Tile-aligned dimensions of the root scene.
     pub scene_size: SizeU16,
+    /// Conservative output bounds, including closed layers and filter expansion.
+    pub content_bounds: RectU16,
     /// The nodes of the root layer.
     pub nodes: Vec<Node>,
     /// Flat storage for all draw commands that are part of the recording.
@@ -202,6 +204,7 @@ impl<D> Default for CommandRecorder<D> {
     fn default() -> Self {
         Self {
             scene_size: SizeU16::ZERO,
+            content_bounds: RectU16::INVERTED,
             nodes: Vec::new(),
             draws: Vec::new(),
             layers: Vec::new(),
@@ -243,6 +246,7 @@ impl<D> CommandRecorder<D> {
     #[inline]
     pub fn reset(&mut self, width: u16, height: u16) {
         self.scene_size = snapped_scene_size(width, height);
+        self.content_bounds = RectU16::INVERTED;
         self.nodes.clear();
         self.draws.clear();
 
@@ -402,15 +406,15 @@ impl<D> CommandRecorder<D> {
     }
 
     fn record_bbox(&mut self, bbox: impl FnOnce() -> Option<RectU16>) {
-        let Some(layer) = self.layer_stack.last_mut() else {
+        let Some(bbox) = bbox().filter(|b| !b.is_empty()) else {
             return;
         };
 
-        let Some(bbox) = bbox().and_then(|b| if b.is_empty() { None } else { Some(b) }) else {
-            return;
-        };
-
-        layer.bbox.union(bbox);
+        if let Some(layer) = self.layer_stack.last_mut() {
+            layer.bbox.union(bbox);
+        } else {
+            self.content_bounds.union(bbox);
+        }
     }
 }
 

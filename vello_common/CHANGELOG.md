@@ -12,6 +12,10 @@ Subheadings to categorize changes are `added, changed, deprecated, removed, fixe
 
 This release has an [MSRV][] of 1.89.
 
+### Added
+
+- `CommandRecorder::content_bounds` for conservative root content bounds. (by [@RobertBrewitz][])
+
 ### Changed
 
 - Breaking change: `FilterPrimitive::GaussianBlur::std_deviation` now takes a `Vec2` instead of an `f32`. (by [@RobertBrewitz][])
