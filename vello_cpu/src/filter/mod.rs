@@ -9,6 +9,7 @@
 //! intermediate buffers.
 
 mod blur_axes;
+mod color_map;
 pub(crate) mod context;
 mod drop_shadow;
 mod flood;
@@ -68,6 +69,14 @@ pub(crate) fn filter_lowp(
     let prepared_filter = PreparedFilter::new(filter, &transform);
 
     match prepared_filter {
+        PreparedFilter::Fill { color } => color_map::fill(pixmap, color),
+        PreparedFilter::Tint {
+            black,
+            white,
+            amount,
+        } => {
+            color_map::tint(pixmap, black, white, amount);
+        }
         PreparedFilter::Flood(flood) => {
             flood.execute_lowp(pixmap, filter_scratch);
         }
@@ -106,6 +115,14 @@ pub(crate) fn filter_highp(
     let prepared_filter = PreparedFilter::new(filter, &transform);
 
     match prepared_filter {
+        PreparedFilter::Fill { color } => color_map::fill(pixmap, color),
+        PreparedFilter::Tint {
+            black,
+            white,
+            amount,
+        } => {
+            color_map::tint(pixmap, black, white, amount);
+        }
         PreparedFilter::Flood(flood) => {
             flood.execute_highp(pixmap, filter_scratch);
         }
