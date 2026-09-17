@@ -235,6 +235,24 @@ impl Renderer {
             .create_view(&TextureViewDescriptor::default())
     }
 
+    /// Finish a frame started with [`Resources::begin_frame`].
+    /// Submit every render using these resources before calling this: maintenance
+    /// can clear atlas regions referenced by those renders.
+    pub fn end_frame(&mut self, resources: &mut Resources, _queue: &Queue) {
+        resources.end_frame();
+        #[cfg(feature = "text")]
+        {
+            let result = resources.after_render(self, |renderer, rect| {
+                clear_atlas_region(_queue, renderer, rect);
+                Ok::<(), core::convert::Infallible>(())
+            });
+            match result {
+                Ok(()) => (),
+                Err(never) => match never {},
+            }
+        }
+    }
+
     /// Render `scene`.
     ///
     /// Every [`TextureId`] referenced by the scene must have a binding; this returns

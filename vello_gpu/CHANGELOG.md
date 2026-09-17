@@ -20,6 +20,7 @@ This release has an [MSRV][] of 1.89.
 
 - `Scene::fill_path` and `Scene::stroke_path` now accept path iterators. (by [@RobertBrewitz][])
 - Gaussian blur with independent X and Y standard deviations and affine-transformed axes. (by [@RobertBrewitz][])
+- `Resources::begin_frame`, `Renderer::end_frame`, and `WebGlRenderer::end_frame` to defer glyph cache maintenance across multiple renders, preventing premature eviction of glyphs referenced by scenes sharing those resources. For wgpu, submit all draws before ending the frame. (by [@RobertBrewitz][])
 
 ## [0.2.0][] - 2026-08-07
 
