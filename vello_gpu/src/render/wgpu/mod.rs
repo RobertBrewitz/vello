@@ -11,6 +11,9 @@ only break in edge cases, and some of them are also only related to conversions 
 
 use crate::draw::{EXTERNAL_TEXTURE_SLOT_COUNT, ExternalTextureBindings, ExternalTextureRun};
 use crate::render::common::IMAGE_PADDING;
+mod group;
+pub use group::{MAX_FLAT_GROUP_SCENES, PreparedFlatGroup};
+
 use crate::util::RangedSlice;
 use crate::{
     ClearSettings, GpuStrip, LayersConfig, RenderError, RenderSettings, RenderSize, Resources,
@@ -283,35 +286,7 @@ impl Renderer {
         target_init: TargetInit<'_>,
     ) -> Result<(), RenderError> {
         #[cfg(feature = "text")]
-        {
-            resources.before_render(
-                self,
-                |renderer, glyph_renderer, atlas_count, atlas_config, atlas_id| {
-                    renderer.render_to_atlas(
-                        glyph_renderer,
-                        atlas_count,
-                        atlas_config,
-                        device,
-                        queue,
-                        atlas_id,
-                        texture_bindings,
-                    )
-                },
-                |renderer, image_cache, upload, dst_x, dst_y| {
-                    renderer.write_to_atlas(
-                        image_cache,
-                        device,
-                        queue,
-                        encoder,
-                        upload.image_id,
-                        &upload.pixmap,
-                        Some([dst_x, dst_y]),
-                    );
-
-                    Ok(())
-                },
-            )?;
-        }
+        self.prepare_glyphs(resources, device, queue, encoder, texture_bindings)?;
 
         let result = self.render_scene(
             scene,
@@ -331,10 +306,47 @@ impl Renderer {
         #[cfg(feature = "text")]
         resources.after_render(self, |renderer, rect| {
             clear_atlas_region(queue, renderer, rect);
-
             Ok::<(), RenderError>(())
         })?;
         result
+    }
+
+    #[cfg(feature = "text")]
+    fn prepare_glyphs(
+        &mut self,
+        resources: &mut Resources,
+        device: &Device,
+        queue: &Queue,
+        encoder: &mut CommandEncoder,
+        texture_bindings: &TextureBindings,
+    ) -> Result<(), RenderError> {
+        resources.before_render(
+            self,
+            |renderer, glyph_renderer, atlas_count, atlas_config, atlas_id| {
+                renderer.render_to_atlas(
+                    glyph_renderer,
+                    atlas_count,
+                    atlas_config,
+                    device,
+                    queue,
+                    atlas_id,
+                    texture_bindings,
+                )
+            },
+            |renderer, image_cache, upload, dst_x, dst_y| {
+                renderer.write_to_atlas(
+                    image_cache,
+                    device,
+                    queue,
+                    encoder,
+                    upload.image_id,
+                    &upload.pixmap,
+                    Some([dst_x, dst_y]),
+                );
+
+                Ok(())
+            },
+        )
     }
 
     /// Render a `scene` directly into an atlas layer.
@@ -508,6 +520,7 @@ impl Renderer {
             external_texture_bind_groups: HashMap::new(),
             scratch_buffers: &mut self.scratch_buffers,
             root_load_op: wgpu::LoadOp::Load,
+            uploaded_strips: None,
         };
 
         ctx.init_root_clear(target_init, root_output_target);
@@ -961,6 +974,7 @@ struct Programs {
     resources: GpuResources,
     /// Arena holding all [`GpuStrip`] data.
     strips_arena: StripBufferArena,
+    flat_group: group::FlatGroupStorage,
     /// Dimensions of the rendering target
     render_size: RenderSize,
     /// Scratch buffer for staging encoded paints texture data.
@@ -1772,6 +1786,7 @@ impl Programs {
             copy_pipeline,
             resources,
             strips_arena: StripBufferArena::new(device),
+            flat_group: group::FlatGroupStorage::default(),
             encoded_paints_data,
             filter_data,
             render_size: RenderSize {
@@ -2607,6 +2622,7 @@ struct RendererContext<'a> {
     external_texture_bind_groups: HashMap<ExternalTextureBindings, BindGroup>,
     scratch_buffers: &'a mut ScratchBuffers,
     root_load_op: wgpu::LoadOp<wgpu::Color>,
+    uploaded_strips: Option<Range<u64>>,
 }
 
 impl RendererContext<'_> {
@@ -2704,9 +2720,10 @@ impl RendererContext<'_> {
             self.external_texture_bind_group_for_textures(run.bindings);
         }
 
-        let strips_range = self
-            .programs
-            .upload_strip_pair(self.queue, opaque_strips, alpha_strips);
+        let strips_range = self.uploaded_strips.take().unwrap_or_else(|| {
+            self.programs
+                .upload_strip_pair(self.queue, opaque_strips, alpha_strips)
+        });
         let opaque_count = opaque_count as u32;
         let alpha_count = alpha_count as u32;
 
