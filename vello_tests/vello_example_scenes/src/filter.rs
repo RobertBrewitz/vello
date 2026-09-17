@@ -10,7 +10,7 @@ use crate::{ExampleScene, RenderingContext};
 use vello_common::color::AlphaColor;
 use vello_common::color::palette::css::{PURPLE, ROYAL_BLUE, SEA_GREEN, TOMATO, VIOLET};
 use vello_common::filter_effects::{EdgeMode, Filter, FilterPrimitive};
-use vello_common::kurbo::{Affine, BezPath, Circle, Rect, Shape};
+use vello_common::kurbo::{Affine, BezPath, Circle, Rect, Shape, Vec2};
 use vello_common::peniko::{BlendMode, Compose, Mix};
 
 /// Filter scene state
@@ -34,7 +34,7 @@ impl ExampleScene for FilterScene {
             edge_mode: EdgeMode::None,
         });
         let filter_gaussian_blur = Filter::from_primitive(FilterPrimitive::GaussianBlur {
-            std_deviation: 10.0,
+            std_deviation: Vec2::new(10.0, 10.0),
             edge_mode: EdgeMode::None,
         });
 
@@ -469,14 +469,14 @@ impl ExampleScene for FilterScene {
         top = y;
         {
             ctx.push_filter_layer(Filter::from_primitive(FilterPrimitive::GaussianBlur {
-                std_deviation: 2.0,
+                std_deviation: Vec2::new(2.0, 2.0),
                 edge_mode: EdgeMode::None,
             }));
             ctx.set_paint(ROYAL_BLUE);
             ctx.fill_rect(&Rect::from_points((left, top), (left + width, top + width)));
             {
                 ctx.push_filter_layer(Filter::from_primitive(FilterPrimitive::GaussianBlur {
-                    std_deviation: 2.0,
+                    std_deviation: Vec2::new(2.0, 2.0),
                     edge_mode: EdgeMode::None,
                 }));
                 ctx.set_paint(PURPLE);
@@ -485,7 +485,7 @@ impl ExampleScene for FilterScene {
                 ctx.fill_rect(&Rect::from_points((left, top), (left + width, top + width)));
                 {
                     ctx.push_filter_layer(Filter::from_primitive(FilterPrimitive::GaussianBlur {
-                        std_deviation: 2.0,
+                        std_deviation: Vec2::new(2.0, 2.0),
                         edge_mode: EdgeMode::None,
                     }));
                     ctx.set_paint(VIOLET);
@@ -495,7 +495,7 @@ impl ExampleScene for FilterScene {
                     {
                         ctx.push_filter_layer(Filter::from_primitive(
                             FilterPrimitive::GaussianBlur {
-                                std_deviation: 2.0,
+                                std_deviation: Vec2::new(2.0, 2.0),
                                 edge_mode: EdgeMode::None,
                             },
                         ));
@@ -506,7 +506,7 @@ impl ExampleScene for FilterScene {
                         {
                             ctx.push_filter_layer(Filter::from_primitive(
                                 FilterPrimitive::GaussianBlur {
-                                    std_deviation: 2.0,
+                                    std_deviation: Vec2::new(2.0, 2.0),
                                     edge_mode: EdgeMode::None,
                                 },
                             ));

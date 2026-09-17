@@ -6,7 +6,7 @@
 use alloc::vec::Vec;
 
 use crate::filter_effects::EdgeMode;
-use crate::kurbo::Affine;
+use crate::kurbo::{Affine, Vec2};
 use crate::util::extract_scales;
 use core::f32::consts::E;
 #[cfg(not(feature = "std"))]
@@ -53,6 +53,7 @@ const _: () = const {
 /// A gaussian blur.
 #[derive(Debug)]
 pub struct GaussianBlur {
+    directional_axes: Option<[Vec2; 2]>,
     /// The standard deviation.
     pub std_deviation: f32,
     /// Number of 2× decimation levels to use (0 means no decimation, direct convolution).
@@ -74,12 +75,43 @@ impl GaussianBlur {
         let (n_decimations, kernel, kernel_size) = plan_decimated_blur(std_deviation);
 
         Self {
+            directional_axes: None,
             std_deviation,
             edge_mode,
             n_decimations,
             kernel,
             kernel_size,
         }
+    }
+
+    pub(crate) fn with_transform(
+        std_deviation: Vec2,
+        edge_mode: EdgeMode,
+        transform: &Affine,
+    ) -> Self {
+        let [a, b, c, d, _, _] = transform.as_coeffs();
+        let axes = [
+            Vec2::new(a, b) * std_deviation.x.max(0.0),
+            Vec2::new(c, d) * std_deviation.y.max(0.0),
+        ];
+        let xx = axes[0].x * axes[0].x + axes[1].x * axes[1].x;
+        let yy = axes[0].y * axes[0].y + axes[1].y * axes[1].y;
+        let xy = axes[0].x * axes[0].y + axes[1].x * axes[1].y;
+        let tolerance = xx.max(yy) * 1e-12;
+        // A circular device-space kernel can use the optimized uniform blur path.
+        if edge_mode == EdgeMode::None && (xx - yy).abs() <= tolerance && xy.abs() <= tolerance {
+            Self::new(xx.sqrt() as f32, edge_mode)
+        } else {
+            Self {
+                directional_axes: Some(axes),
+                ..Self::new(0.0, edge_mode)
+            }
+        }
+    }
+
+    /// Device-space axes for direct convolution, or `None` for the uniform kernel.
+    pub fn directional_axes(&self) -> Option<[Vec2; 2]> {
+        self.directional_axes
     }
 }
 

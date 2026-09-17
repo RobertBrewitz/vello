@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
 import package::filters::blur::{BLUR_HORIZONTAL, BLUR_VERTICAL, gaussian_blur};
+import package::filters::blur_axes::blur_axis;
 import package::filters::drop_shadow::{
     colorize_drop_shadow,
     composite_drop_shadow,
@@ -42,13 +43,15 @@ const PASS_BLUR_V: u32 = 5u;
 const PASS_UPSCALE: u32 = 6u;
 const PASS_COMPOSITE_DROP_SHADOW: u32 = 7u;
 const PASS_COLORIZE: u32 = 8u;
+const PASS_BLUR_AXIS_X: u32 = 9u;
+const PASS_BLUR_AXIS_Y: u32 = 10u;
 
 // Keep in sync with FILTER_ATLAS_PADDING in vello_gpu/src/filter.rs.
 const FILTER_ATLAS_PADDING: u32 = 6u;
 
 // The layout of the header:
 //   bits [0:4]   = filter_type   (5 bits)
-//   bits [5:6]   = edge_mode     (2 bits, only for blur filters), currently ignored.
+//   bits [5:6]   = edge_mode     (2 bits, direct blur filters)
 //   bits [7:10]  = n_decimations (4 bits, only for blur filters), only read on the CPU side.
 //   bits [11:12] = n_linear_taps (2 bits, only for blur filters)
 //   bit  [13]    = composite_original (only for drop shadows), only read on the CPU side.
@@ -249,6 +252,32 @@ fn fs_main(
                 source_origin,
                 dest_origin,
             );
+        }
+        case PASS_BLUR_AXIS_X, PASS_BLUR_AXIS_Y: {
+            let t0 = load_filter_texel(filter_data_offset, 0u);
+            let t1 = load_filter_texel(filter_data_offset, 1u);
+            let x = vec2<f32>(bitcast<f32>(t0.y), bitcast<f32>(t0.z));
+            let y = vec2<f32>(bitcast<f32>(t0.w), bitcast<f32>(t1.x));
+            let edge_mode = (t0.x >> 5u) & 3u;
+            let bounds_origin = unpack_u16_pair(t1.y);
+            let bounds_size = unpack_u16_pair(t1.z);
+            if any(bounds_size == vec2<u32>(0u)) { return vec4<f32>(0.0); }
+            // Tile padding must not become visible through duplicate or wrap sampling.
+            if filter_pass_kind == PASS_BLUR_AXIS_Y {
+                let expansion = ceil(3.0 * (abs(x) + abs(y)));
+                let lower = vec2<f32>(bounds_origin) - expansion;
+                let upper = vec2<f32>(bounds_origin + bounds_size) + expansion;
+                if any(rel_coord < lower) || any(rel_coord >= upper) {
+                    return vec4<f32>(0.0);
+                }
+            }
+            // Wrap's period is the source content, not the larger padded intermediate.
+            if filter_pass_kind == PASS_BLUR_AXIS_X || edge_mode == 1u {
+                return blur_axis(source_texture, source_origin + bounds_origin, bounds_size,
+                                 rel_coord - vec2<f32>(bounds_origin),
+                                 select(x, y, filter_pass_kind == PASS_BLUR_AXIS_Y), edge_mode);
+            }
+            return blur_axis(source_texture, source_origin, source_size, rel_coord, y, edge_mode);
         }
         case PASS_COMPOSITE_DROP_SHADOW: {
             let filter_texel2 = load_filter_texel(filter_data_offset, 2u);

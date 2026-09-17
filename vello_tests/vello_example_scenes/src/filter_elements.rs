@@ -7,7 +7,7 @@
 use crate::{ExampleScene, RenderingContext};
 use vello_common::color::palette::css;
 use vello_common::filter_effects::{EdgeMode, Filter, FilterPrimitive};
-use vello_common::kurbo::{Affine, BezPath, Circle, Rect, RoundedRect, Shape, Stroke};
+use vello_common::kurbo::{Affine, BezPath, Circle, Rect, RoundedRect, Shape, Stroke, Vec2};
 use vello_common::peniko::Color;
 
 const BATCH_SIZE: usize = 10;
@@ -164,7 +164,10 @@ impl ExampleScene for FilterElementsScene {
                     FilterKind::None => unreachable!(),
                     FilterKind::Blur { std_deviation } => {
                         Filter::from_primitive(FilterPrimitive::GaussianBlur {
-                            std_deviation,
+                            std_deviation: Vec2::new(
+                                f64::from(std_deviation),
+                                f64::from(std_deviation),
+                            ),
                             edge_mode: EdgeMode::None,
                         })
                     }
