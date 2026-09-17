@@ -12,6 +12,14 @@ Subheadings to categorize changes are `added, changed, deprecated, removed, fixe
 
 This release has an [MSRV][] of 1.89.
 
+### Added
+
+- `Scene::try_append` and `Scene::take_recording` for parallel CPU-side scene preparation. (by [@RobertBrewitz][])
+
+### Changed
+
+- `Scene::fill_path` and `Scene::stroke_path` now accept path iterators. (by [@RobertBrewitz][])
+
 ### Fixed
 
 - A potential division by zero in `clip_color` for gray colors in the `Color` and `Luminosity` blend modes. ([#2000][] by [@zlstringham][])
@@ -269,6 +277,7 @@ See also the [vello_cpu 0.0.4](../vello_cpu/CHANGELOG.md#004---2025-10-17) and [
 [@LaurenzV]: https://github.com/LaurenzV
 [@nicoburns]: https://github.com/nicoburns
 [@oscargus]: https://github.com/oscargus
+[@RobertBrewitz]: https://github.com/RobertBrewitz
 [@taj-p]: https://github.com/taj-p
 [@tomcur]: https://github.com/tomcur
 [@tronical]: https://github.com/tronical
