@@ -12,6 +12,14 @@ Subheadings to categorize changes are `added, changed, deprecated, removed, fixe
 
 This release has an [MSRV][] of 1.89.
 
+### Added
+
+- `Scene::try_append` and `Scene::take_recording` for parallel CPU-side scene preparation. (by [@RobertBrewitz][])
+
+### Changed
+
+- `Scene::fill_path` and `Scene::stroke_path` now accept path iterators. (by [@RobertBrewitz][])
+
 ## [0.2.0][] - 2026-08-07
 
 This release has an [MSRV][] of 1.88.
@@ -216,6 +224,7 @@ See also the [vello_cpu 0.0.4](../vello_cpu/CHANGELOG.md#004---2025-10-17) and [
 [@upsuper]: https://github.com/upsuper
 [@waywardmonkeys]: https://github.com/waywardmonkeys
 [@xStrom]: https://github.com/xStrom
+[@RobertBrewitz]: https://github.com/RobertBrewitz
 
 [#1203]: https://github.com/linebender/vello/pull/1203
 [#1349]: https://github.com/linebender/vello/pull/1349

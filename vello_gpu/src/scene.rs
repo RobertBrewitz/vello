@@ -18,7 +18,7 @@ use vello_common::fearless_simd::Level;
 use vello_common::filter::FilterData;
 use vello_common::filter_effects::Filter;
 use vello_common::geometry::{RectU16, SizeU16};
-use vello_common::kurbo::{Affine, BezPath, Rect, Shape, Stroke};
+use vello_common::kurbo::{Affine, BezPath, PathEl, Rect, Shape, Stroke};
 use vello_common::mask::Mask;
 use vello_common::multi_atlas::AtlasConfig;
 use vello_common::paint::{Paint, PaintType, Tint};
@@ -305,7 +305,7 @@ impl Scene {
     }
 
     /// Fill a path with the current paint and fill rule.
-    pub fn fill_path(&mut self, path: &BezPath) {
+    pub fn fill_path(&mut self, path: impl IntoIterator<Item = PathEl>) {
         if !self.paint_visible {
             return;
         }
@@ -325,7 +325,7 @@ impl Scene {
     /// Build strips for a filled path with the given properties and record the draw.
     fn fill_path_with(
         &mut self,
-        path: &BezPath,
+        path: impl IntoIterator<Item = PathEl>,
         transform: Affine,
         fill_rule: Fill,
         paint: Paint,
@@ -377,7 +377,7 @@ impl Scene {
     }
 
     /// Stroke a path with the current paint and stroke settings.
-    pub fn stroke_path(&mut self, path: &BezPath) {
+    pub fn stroke_path(&mut self, path: impl IntoIterator<Item = PathEl>) {
         if !self.paint_visible {
             return;
         }
@@ -396,7 +396,7 @@ impl Scene {
     /// Build strips for a stroked path with the given properties and record the draw.
     fn stroke_path_with(
         &mut self,
-        path: &BezPath,
+        path: impl IntoIterator<Item = PathEl>,
         transform: Affine,
         paint: Paint,
         aliasing_threshold: Option<u8>,
