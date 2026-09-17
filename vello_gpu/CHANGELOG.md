@@ -12,6 +12,10 @@ Subheadings to categorize changes are `added, changed, deprecated, removed, fixe
 
 This release has an [MSRV][] of 1.89.
 
+### Changed
+
+- `Scene::fill_path` and `Scene::stroke_path` now accept path iterators. (by [@RobertBrewitz][])
+
 ## [0.2.0][] - 2026-08-07
 
 This release has an [MSRV][] of 1.88.
@@ -210,6 +214,7 @@ See also the [vello_cpu 0.0.4](../vello_cpu/CHANGELOG.md#004---2025-10-17) and [
 [@LaurenzV]: https://github.com/LaurenzV
 [@nicoburns]: https://github.com/nicoburns
 [@oscargus]: https://github.com/oscargus
+[@RobertBrewitz]: https://github.com/RobertBrewitz
 [@taj-p]: https://github.com/taj-p
 [@tomcur]: https://github.com/tomcur
 [@tronical]: https://github.com/tronical
