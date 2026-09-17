@@ -26,6 +26,20 @@ pub mod offset;
 /// A filter that has been prepared for rendering.
 #[derive(Debug)]
 pub enum PreparedFilter {
+    /// Source-coverage recoloring.
+    Fill {
+        /// Replacement color.
+        color: crate::color::AlphaColor<crate::color::Srgb>,
+    },
+    /// Source-alpha-preserving luminance mapping.
+    Tint {
+        /// Color for black source pixels.
+        black: crate::color::AlphaColor<crate::color::Srgb>,
+        /// Color for white source pixels.
+        white: crate::color::AlphaColor<crate::color::Srgb>,
+        /// Mix with the source in the range 0 to 1.
+        amount: f32,
+    },
     /// A flood filter.
     Flood(Flood),
     /// A gaussian blur filter.
@@ -45,6 +59,16 @@ impl PreparedFilter {
         }
 
         match &filter.graph.primitives[0] {
+            FilterPrimitive::Fill { color } => Self::Fill { color: *color },
+            FilterPrimitive::Tint {
+                black,
+                white,
+                amount,
+            } => Self::Tint {
+                black: *black,
+                white: *white,
+                amount: amount.clamp(0.0, 1.0),
+            },
             FilterPrimitive::Flood { color } => {
                 let flood = Flood::new(*color);
                 Self::Flood(flood)

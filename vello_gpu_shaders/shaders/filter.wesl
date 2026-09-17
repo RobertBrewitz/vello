@@ -3,6 +3,7 @@
 
 import package::filters::blur::{BLUR_HORIZONTAL, BLUR_VERTICAL, gaussian_blur};
 import package::filters::blur_axes::blur_axis;
+import package::filters::color_map::{filter_color, tint_color};
 import package::filters::drop_shadow::{
     colorize_drop_shadow,
     composite_drop_shadow,
@@ -45,6 +46,7 @@ const PASS_COMPOSITE_DROP_SHADOW: u32 = 7u;
 const PASS_COLORIZE: u32 = 8u;
 const PASS_BLUR_AXIS_X: u32 = 9u;
 const PASS_BLUR_AXIS_Y: u32 = 10u;
+const PASS_MAP_COLOR: u32 = 11u;
 
 // Keep in sync with FILTER_ATLAS_PADDING in vello_gpu/src/filter.rs.
 const FILTER_ATLAS_PADDING: u32 = 6u;
@@ -278,6 +280,16 @@ fn fs_main(
                                  select(x, y, filter_pass_kind == PASS_BLUR_AXIS_Y), edge_mode);
             }
             return blur_axis(source_texture, source_origin, source_size, rel_coord, y, edge_mode);
+        }
+        case PASS_MAP_COLOR: {
+            let t0 = load_filter_texel(filter_data_offset, 0u);
+            let t1 = load_filter_texel(filter_data_offset, 1u);
+            let t2 = load_filter_texel(filter_data_offset, 2u);
+            let source = sample_source(source_origin, rel_coord);
+            let first = bitcast<vec4<f32>>(vec4<u32>(t0.yzw, t1.x));
+            if get_filter_type(t0) == 5u { return filter_color(first) * source.a; }
+            let second = bitcast<vec4<f32>>(vec4<u32>(t1.yzw, t2.x));
+            return tint_color(source, first.rgb, second.rgb, bitcast<f32>(t2.y));
         }
         case PASS_COMPOSITE_DROP_SHADOW: {
             let filter_texel2 = load_filter_texel(filter_data_offset, 2u);
