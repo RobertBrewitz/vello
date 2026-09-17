@@ -19,6 +19,7 @@ This release has an [MSRV][] of 1.89.
 ### Changed
 
 - `Scene::fill_path` and `Scene::stroke_path` now accept path iterators. (by [@RobertBrewitz][])
+- Gaussian blur with independent X and Y standard deviations and affine-transformed axes. (by [@RobertBrewitz][])
 
 ## [0.2.0][] - 2026-08-07
 

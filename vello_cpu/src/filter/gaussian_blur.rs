@@ -29,6 +29,11 @@ use vello_common::pixmap::Pixmap;
 
 impl FilterEffect for GaussianBlur {
     fn execute_lowp(&self, pixmap: &mut Pixmap, filter_scratch: &mut ScratchBuffer) {
+        if let Some(axes) = self.directional_axes() {
+            super::blur_axes::apply(axes, self.edge_mode, pixmap);
+            return;
+        }
+
         // No blur if std_deviation is zero or negative
         if self.std_deviation <= 0.0 {
             return;

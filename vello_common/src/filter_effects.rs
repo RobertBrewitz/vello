@@ -78,7 +78,7 @@ impl Filter {
         // Convert function to primitive
         let primitive = match function {
             FilterFunction::Blur { radius } => FilterPrimitive::GaussianBlur {
-                std_deviation: radius,
+                std_deviation: Vec2::new(f64::from(radius), f64::from(radius)),
                 edge_mode: EdgeMode::default(),
             },
             _ => unimplemented!("Filter function {:?} not supported", function),
@@ -372,22 +372,13 @@ pub enum FilterPrimitive {
     },
     /// Gaussian blur filter.
     ///
-    /// Applies a Gaussian blur using the specified standard deviation (σ).
-    /// The effective blur range (distance over which pixels are sampled) is
-    /// approximately 3 × `std_deviation`, as this captures ~99.7% of the
-    /// Gaussian distribution.
+    /// Applies Gaussian blur with independent X and Y standard deviations (σ).
+    /// The layer transform rotates and scales both axes. The blur extends approximately
+    /// 3σ along each axis.
     GaussianBlur {
-        /// Standard deviation for the blur kernel. Larger values create more blur.
-        /// Must be non-negative. A value of 0 means no blur.
-        ///
-        /// This directly corresponds to the σ (sigma) parameter in the Gaussian
-        /// function. The visible blur effect extends approximately 3σ in each direction.
-        ///
-        /// TODO: Per the W3C specification, this should support separate x and y values.
-        /// The spec allows `stdDeviation` to be either one number (applied to both axes)
-        /// or two numbers (first for x-axis, second for y-axis). Currently only uniform
-        /// blur is supported. Consider changing to `(f32, f32)` or a dedicated type.
-        std_deviation: f32,
+        /// Nonnegative standard deviations in layer coordinates.
+        /// Zero disables blur on that axis; equal values give uniform blur.
+        std_deviation: Vec2,
         /// Edge mode determining how pixels beyond the input bounds are handled.
         edge_mode: EdgeMode,
     },
@@ -578,8 +569,9 @@ impl FilterPrimitive {
     pub fn filter_expansion(&self) -> Rect {
         match self {
             Self::GaussianBlur { std_deviation, .. } => {
-                let radius = blur_radius(*std_deviation);
-                Rect::new(-radius, -radius, radius, radius)
+                let x = blur_radius(std_deviation.x.max(0.0) as f32);
+                let y = blur_radius(std_deviation.y.max(0.0) as f32);
+                Rect::new(-x, -y, x, y)
             }
             Self::Offset { dx, dy } => {
                 // Offset shifts pixels; expand bounds asymmetrically so shifted content isn't cut.

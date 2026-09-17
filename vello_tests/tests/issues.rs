@@ -10,7 +10,7 @@ use std::sync::Arc;
 use vello_common::color::PremulRgba8;
 use vello_common::color::palette::css::{BLUE, DARK_BLUE, LIME, REBECCA_PURPLE};
 use vello_common::filter_effects::{EdgeMode, Filter, FilterPrimitive};
-use vello_common::kurbo::{Affine, BezPath, Circle, Rect, Shape, Stroke};
+use vello_common::kurbo::{Affine, BezPath, Circle, Rect, Shape, Stroke, Vec2};
 use vello_common::paint::Image;
 use vello_common::peniko::GradientKind::Radial;
 use vello_common::peniko::color::palette::css::{PURPLE, ROYAL_BLUE, TOMATO};
@@ -661,7 +661,7 @@ fn opaque_rect_partially_occluding_aa_edge(ctx: &mut impl Renderer) {
 #[vello_test(skip_multithreaded, width = 768, height = 100, gpu_tolerance = 4)]
 fn issue_1509(ctx: &mut impl Renderer) {
     let filter = Filter::from_primitive(FilterPrimitive::GaussianBlur {
-        std_deviation: 25.0,
+        std_deviation: Vec2::new(25.0, 25.0),
         edge_mode: EdgeMode::None,
     });
     let rect = Rect::new(100.0, 10.0, 668.0, 90.0);

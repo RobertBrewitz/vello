@@ -8,6 +8,7 @@
 //! Filters are applied to rendered layer pixmaps and may use scratch storage for
 //! intermediate buffers.
 
+mod blur_axes;
 pub(crate) mod context;
 mod drop_shadow;
 mod flood;
