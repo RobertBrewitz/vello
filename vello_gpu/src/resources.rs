@@ -15,6 +15,7 @@ use vello_common::multi_atlas::AtlasConfig;
 /// A set of resources must only be used with the renderer instance associated with it.
 #[derive(Debug)]
 pub struct Resources {
+    pub(crate) frame_active: bool,
     pub(crate) image_cache: ImageCache,
     #[cfg(feature = "text")]
     pub(crate) glyph_prep_cache: GlyphPrepCache,
@@ -23,8 +24,22 @@ pub struct Resources {
 }
 
 impl Resources {
+    /// Defer glyph cache maintenance until the renderer's `end_frame` call.
+    /// All scenes sharing these resources must be submitted before ending the frame.
+    /// Frames cannot be nested.
+    pub fn begin_frame(&mut self) {
+        assert!(!self.frame_active, "A frame is already active");
+        self.frame_active = true;
+    }
+
+    pub(crate) fn end_frame(&mut self) {
+        assert!(self.frame_active, "No frame is active");
+        self.frame_active = false;
+    }
+
     pub(crate) fn new(image_atlas_config: AtlasConfig) -> Self {
         Self {
+            frame_active: false,
             image_cache: ImageCache::new_with_config(image_atlas_config),
             #[cfg(feature = "text")]
             glyph_prep_cache: GlyphPrepCache::default(),
