@@ -362,6 +362,20 @@ pub enum EdgeMode {
 /// See: <https://drafts.fxtf.org/filter-effects/#FilterPrimitivesOverview>
 #[derive(Debug, Clone, PartialEq)]
 pub enum FilterPrimitive {
+    /// Recolor source coverage without filling transparent pixels.
+    Fill {
+        /// Replacement color; its alpha multiplies source alpha.
+        color: AlphaColor<Srgb>,
+    },
+    /// Map sRGB luminance between two colors while preserving source alpha.
+    Tint {
+        /// Color for black source pixels; alpha is ignored.
+        black: AlphaColor<Srgb>,
+        /// Color for white source pixels; alpha is ignored.
+        white: AlphaColor<Srgb>,
+        /// Mix with the source, clamped to the range 0 to 1.
+        amount: f32,
+    },
     /// Generate a solid color fill.
     ///
     /// Creates a rectangle filled with the specified color, typically used as

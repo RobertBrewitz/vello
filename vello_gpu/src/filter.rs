@@ -63,6 +63,8 @@ pub(crate) mod filter_type {
     pub(crate) const GAUSSIAN_BLUR: u32 = 2;
     pub(crate) const DROP_SHADOW: u32 = 3;
     pub(crate) const BLUR_AXES: u32 = 4;
+    pub(crate) const FILL: u32 = 5;
+    pub(crate) const TINT: u32 = 6;
 }
 
 pub(crate) mod edge_mode {
@@ -84,6 +86,7 @@ pub(crate) mod pass_kind {
     pub(crate) const COLORIZE: u32 = 8;
     pub(crate) const BLUR_AXIS_X: u32 = 9;
     pub(crate) const BLUR_AXIS_Y: u32 = 10;
+    pub(crate) const MAP_COLOR: u32 = 11;
 }
 
 pub(crate) fn edge_mode_to_gpu(mode: EdgeMode) -> u32 {
@@ -379,6 +382,30 @@ impl From<&GaussianBlur> for GpuFilterData {
 impl From<&PreparedFilter> for GpuFilterData {
     fn from(filter: &PreparedFilter) -> Self {
         match filter {
+            PreparedFilter::Fill { color } => {
+                let mut data = Self::zeroed();
+                data.data[0] = pack_header(filter_type::FILL);
+                for (target, component) in data.data[1..5].iter_mut().zip(color.components) {
+                    *target = component.to_bits();
+                }
+                data
+            }
+            PreparedFilter::Tint {
+                black,
+                white,
+                amount,
+            } => {
+                let mut data = Self::zeroed();
+                data.data[0] = pack_header(filter_type::TINT);
+                for (target, component) in data.data[1..5].iter_mut().zip(black.components) {
+                    *target = component.to_bits();
+                }
+                for (target, component) in data.data[5..9].iter_mut().zip(white.components) {
+                    *target = component.to_bits();
+                }
+                data.data[9] = amount.to_bits();
+                data
+            }
             PreparedFilter::Offset(f) => GpuOffset::from(f).into(),
             PreparedFilter::Flood(f) => GpuFlood::from(f).into(),
             PreparedFilter::GaussianBlur(f) => Self::from(f),
@@ -468,6 +495,7 @@ impl FilterPassPlan {
                     builder.emit(pass_kind::BLUR_AXIS_X);
                     builder.emit(pass_kind::BLUR_AXIS_Y);
                 }
+                filter_type::FILL | filter_type::TINT => builder.emit(pass_kind::MAP_COLOR),
                 filter_type::DROP_SHADOW => {
                     builder.emit(pass_kind::OFFSET);
                     builder.emit_blur_sequence(filter.gpu_filter.n_decimations());
