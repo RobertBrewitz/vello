@@ -803,9 +803,14 @@ impl<'a, 'p> Scheduler<'a, 'p> {
     ) -> Result<&'b mut LayerTarget, RenderError> {
         if layer.target.is_none() {
             let filter = match layer.kind {
-                RecordedLayerKind::Filter { filter_data, .. } => {
-                    Some(self.storage.filter_context.push(filter_data))
-                }
+                RecordedLayerKind::Filter {
+                    filter_data,
+                    placement,
+                } => Some(
+                    self.storage
+                        .filter_context
+                        .push(filter_data, placement.source_bounds),
+                ),
                 RecordedLayerKind::Regular => None,
             };
 
