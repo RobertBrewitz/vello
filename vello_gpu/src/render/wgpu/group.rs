@@ -199,7 +199,7 @@ impl Renderer {
                 )
                 .saturating_add(scene.encoded_paints.len() * size_of::<GpuEncodedPaint>())
                 .saturating_add(scene_strips * size_of::<GpuStrip>())
-                .saturating_add(gradients * MAX_GRADIENT_LUT_SIZE * 4);
+                .saturating_add(gradients * MAX_GRADIENT_LUT_SIZE * BYTES_PER_TEXEL as usize);
             if bytes > byte_limit {
                 break;
             }

@@ -10,9 +10,9 @@ use vello_common::fearless_simd::{Level, Simd, dispatch};
 use vello_common::peniko::color::cache_key::CacheKey;
 
 /// Number of bytes per texel in the gradient texture.
-/// Gradient textures use `Rgba8Unorm` format (4 bytes per texel).
+/// Gradient textures use `Rgba32Float` format (16 bytes per texel).
 /// This constant is used to convert between byte offsets and texel indices.
-const BYTES_PER_TEXEL: u32 = 4;
+pub(crate) const BYTES_PER_TEXEL: u32 = 16;
 
 #[derive(Debug)]
 pub(crate) struct GradientRampCache {
@@ -26,7 +26,6 @@ pub(crate) struct GradientRampCache {
     has_changed: bool,
     /// Maximum number of gradient cache entries to retain.
     retained_count: u32,
-    /// SIMD level used for gradient LUT generation.
     level: Level,
     /// Scratch space for maintaining the cache.
     scratch: ScratchSpace,
@@ -278,7 +277,7 @@ fn generate_gradient_lut_impl<S: Simd>(
     gradient: &EncodedGradient,
     output: &mut Vec<u8>,
 ) -> usize {
-    let lut = gradient.u8_lut(simd);
+    let lut = gradient.f32_lut(simd);
     let bytes: &[u8] = bytemuck::cast_slice(lut.lut());
     output.reserve(bytes.len());
     output.extend_from_slice(bytes);
