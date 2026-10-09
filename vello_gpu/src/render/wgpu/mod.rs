@@ -21,7 +21,7 @@ use crate::{
     blend::{BlendStrip, GpuBlendInstance},
     copy::GpuCopyInstance,
     filter::{FilterContext, FilterInstanceData, FilterPassPlan},
-    gradient_cache::GradientRampCache,
+    gradient_cache::{BYTES_PER_TEXEL, GradientRampCache},
     paint::{PaintResolver, TextureSourceId},
     render::{
         Config,
@@ -926,6 +926,7 @@ fn clear_atlas_region(queue: &Queue, renderer: &mut Renderer, rect: &PendingClea
 struct Programs {
     /// Intermediate strip pipeline.
     intermediate_strip_pipeline: RenderPipeline,
+    atlas_strip_pipeline: RenderPipeline,
     /// Root alpha-strip pipeline.
     alpha_strip_pipeline: RenderPipeline,
     /// Root alpha-strip pipeline with depth testing.
@@ -964,6 +965,7 @@ struct Programs {
     clear_pipeline: RenderPipeline,
     /// User-target rectangle-clear pipeline.
     root_clear_pipeline: RenderPipeline,
+    atlas_rect_clear_pipeline: RenderPipeline,
     /// Pipeline for clearing atlas regions.
     atlas_clear_pipeline: RenderPipeline,
     /// Blend pipeline.
@@ -1201,7 +1203,7 @@ impl Programs {
                     binding: 0,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
                         view_dimension: wgpu::TextureViewDimension::D2,
                         multisampled: false,
                     },
@@ -1288,6 +1290,12 @@ impl Programs {
 
         let intermediate_strip_pipeline = create_strip_pipeline(
             "Strip Intermediate Pipeline",
+            wgpu::TextureFormat::Rgba16Float,
+            Some(BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+            None,
+        );
+        let atlas_strip_pipeline = create_strip_pipeline(
+            "Strip Atlas Pipeline",
             wgpu::TextureFormat::Rgba8Unorm,
             Some(BlendState::PREMULTIPLIED_ALPHA_BLENDING),
             None,
@@ -1355,7 +1363,9 @@ impl Programs {
             })
         };
         let clear_pipeline =
-            create_clear_pipeline("Clear Pipeline", wgpu::TextureFormat::Rgba8Unorm);
+            create_clear_pipeline("Clear Pipeline", wgpu::TextureFormat::Rgba16Float);
+        let atlas_rect_clear_pipeline =
+            create_clear_pipeline("Atlas Rect Clear Pipeline", wgpu::TextureFormat::Rgba8Unorm);
         let root_clear_pipeline =
             create_clear_pipeline("Root Clear Pipeline", render_target_config.format);
 
@@ -1483,7 +1493,7 @@ impl Programs {
                 module: &filter_shader,
                 entry_point: Some("fs_main"),
                 targets: &[Some(ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    format: wgpu::TextureFormat::Rgba16Float,
                     blend: None,
                     write_mask: ColorWrites::ALL,
                 })],
@@ -1611,7 +1621,7 @@ impl Programs {
                         module: shader_module,
                         entry_point: Some("fs_main"),
                         targets: &[Some(ColorTargetState {
-                            format: wgpu::TextureFormat::Rgba8Unorm,
+                            format: wgpu::TextureFormat::Rgba16Float,
                             blend: None,
                             write_mask: ColorWrites::ALL,
                         })],
@@ -1772,6 +1782,8 @@ impl Programs {
 
         Self {
             intermediate_strip_pipeline,
+            atlas_strip_pipeline,
+            atlas_rect_clear_pipeline,
             alpha_strip_pipeline,
             depth_alpha_strip_pipeline,
             opaque_strip_pipeline,
@@ -1821,7 +1833,7 @@ impl Programs {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
+            format: wgpu::TextureFormat::Rgba16Float,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[],
         });
@@ -2117,7 +2129,7 @@ impl Programs {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
+            format: wgpu::TextureFormat::Rgba32Float,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         })
@@ -2320,7 +2332,7 @@ impl Programs {
         resource_texture_dimension_2d: u32,
         gradient_cache: &GradientRampCache,
     ) {
-        let gradient_pixels = (gradient_cache.luts_size() / 4) as u32; // 4 bytes per RGBA8 pixel
+        let gradient_pixels = (gradient_cache.luts_size() / BYTES_PER_TEXEL as usize) as u32;
         let required_gradient_height = gradient_pixels.div_ceil(resource_texture_dimension_2d);
         debug_assert!(
             self.resources.gradient_texture.width() == resource_texture_dimension_2d,
@@ -2538,7 +2550,8 @@ impl Programs {
 
         // Upload the gradient LUT data
         if !gradient_cache.is_empty() {
-            let total_capacity = (gradient_texture_width * gradient_texture_height * 4) as usize;
+            let total_capacity =
+                (gradient_texture_width * gradient_texture_height * BYTES_PER_TEXEL) as usize;
 
             // Take ownership of the luts to avoid copying, then resize for texture padding
             let mut luts = gradient_cache.take_luts();
@@ -2555,8 +2568,7 @@ impl Programs {
                 &luts,
                 wgpu::TexelCopyBufferLayout {
                     offset: 0,
-                    // 4 bytes per RGBA8 pixel
-                    bytes_per_row: Some(gradient_texture_width << 2),
+                    bytes_per_row: Some(gradient_texture_width * BYTES_PER_TEXEL),
                     rows_per_image: Some(gradient_texture_height),
                 },
                 Extent3d {
@@ -2872,6 +2884,8 @@ impl RendererContext<'_> {
                     &self.programs.alpha_strip_pipeline
                 };
                 render_pass.set_pipeline(pipeline);
+            } else if matches!(target, DrawPassTarget::Root(_)) {
+                render_pass.set_pipeline(&self.programs.atlas_strip_pipeline);
             } else {
                 render_pass.set_pipeline(&self.programs.intermediate_strip_pipeline);
             }
@@ -3066,7 +3080,11 @@ impl RendererContext<'_> {
                     self.programs.render_size.width,
                     self.programs.render_size.height,
                 ],
-                &self.programs.root_clear_pipeline,
+                if matches!(target, DrawPassTarget::Root(RootTarget::UserSurface)) {
+                    &self.programs.root_clear_pipeline
+                } else {
+                    &self.programs.atlas_rect_clear_pipeline
+                },
             ),
             DrawPassTarget::Layer(_) => {
                 let texture_size = self.texture_size();

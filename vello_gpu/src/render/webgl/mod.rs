@@ -43,7 +43,7 @@ use crate::{
     blend::{BlendStrip, GpuBlendInstance},
     copy::GpuCopyInstance,
     filter::{FilterContext, FilterInstanceData, FilterPassPlan},
-    gradient_cache::GradientRampCache,
+    gradient_cache::{BYTES_PER_TEXEL, GradientRampCache},
     paint::{PaintResolver, TextureSourceId},
     render::{
         Config,
@@ -1357,6 +1357,7 @@ pub(crate) struct WebGlResources {
     scratch_texture: Option<ScratchTexture<WebGlIntermediateTexture>>,
     /// Config buffer for rendering strips into a layer texture.
     layer_config_buffer: Buffer,
+    intermediate_format: u32,
     /// Layer texture pages grouped by parity.
     layer_textures: [Vec<WebGlIntermediateTexture>; 2],
 }
@@ -1705,11 +1706,19 @@ impl WebGlPrograms {
                 let page_count = textures.len().max(required_page_count);
                 textures.clear();
                 for _ in 0..page_count {
-                    textures.push(create_intermediate_texture(gl, texture_size)?);
+                    textures.push(create_intermediate_texture(
+                        gl,
+                        texture_size,
+                        self.resources.intermediate_format,
+                    )?);
                 }
             } else {
                 for _ in textures.len()..required_page_count {
-                    textures.push(create_intermediate_texture(gl, texture_size)?);
+                    textures.push(create_intermediate_texture(
+                        gl,
+                        texture_size,
+                        self.resources.intermediate_format,
+                    )?);
                 }
             }
         }
@@ -1722,7 +1731,7 @@ impl WebGlPrograms {
             let _ = self.resources.scratch_texture.take();
 
             self.resources.scratch_texture = Some(ScratchTexture::new(
-                create_intermediate_texture(gl, texture_size)?,
+                create_intermediate_texture(gl, texture_size, self.resources.intermediate_format)?,
             ));
         }
 
@@ -1921,9 +1930,8 @@ impl WebGlPrograms {
         }
 
         let gradient_data_size = gradient_cache.luts_size();
-        // Each texel is RGBA8, so 4 bytes per texel
         let required_gradient_height =
-            (gradient_data_size as u32).div_ceil(resource_texture_dimension_2d * 4);
+            (gradient_data_size as u32).div_ceil(resource_texture_dimension_2d * BYTES_PER_TEXEL);
 
         let current_gradient_height = self.resources.gradient_texture_height;
         if required_gradient_height > current_gradient_height {
@@ -1935,7 +1943,7 @@ impl WebGlPrograms {
 
             self.resources.gradient_texture = create_data_texture_storage(
                 gl,
-                WebGl2RenderingContext::RGBA8,
+                WebGl2RenderingContext::RGBA32F,
                 resource_texture_dimension_2d,
                 required_gradient_height,
             )?;
@@ -2055,10 +2063,9 @@ impl WebGlPrograms {
         }
 
         let gradient_texture_width = self.resources.resource_texture_dimension_2d;
-        // Each texel is RGBA8, so 4 bytes per texel. Only the rows covering the LUT cache are
-        // uploaded; see `upload_alpha_texture`.
-        let used_height = (gradient_cache.luts_size() as u32).div_ceil(gradient_texture_width * 4);
-        let used_size = (gradient_texture_width * used_height * 4) as usize;
+        let used_height =
+            (gradient_cache.luts_size() as u32).div_ceil(gradient_texture_width * BYTES_PER_TEXEL);
+        let used_size = (gradient_texture_width * used_height * BYTES_PER_TEXEL) as usize;
 
         // Take ownership of the luts to avoid copying, then pad to the end of the last used row.
         let mut luts = gradient_cache.take_luts();
@@ -2071,8 +2078,10 @@ impl WebGlPrograms {
             Some(&self.resources.gradient_texture),
         );
 
+        let bytes = js_sys::Uint8Array::from(luts.as_slice());
+        let floats = js_sys::Float32Array::new(&bytes.buffer());
         let result = gl
-            .tex_sub_image_2d_with_i32_and_i32_and_u32_and_type_and_opt_u8_array(
+            .tex_sub_image_2d_with_i32_and_i32_and_u32_and_type_and_opt_array_buffer_view(
                 WebGl2RenderingContext::TEXTURE_2D,
                 0,
                 0,
@@ -2080,8 +2089,8 @@ impl WebGlPrograms {
                 gradient_texture_width as i32,
                 used_height as i32,
                 WebGl2RenderingContext::RGBA,
-                WebGl2RenderingContext::UNSIGNED_BYTE,
-                Some(&luts),
+                WebGl2RenderingContext::FLOAT,
+                Some(&floats),
             )
             .map_js_error(WebGlOperation::DataTransfer(
                 WebGlDataTransferOperation::TextureUpload,
@@ -2526,6 +2535,20 @@ fn create_webgl_resources(
     let view_config_buffer = Buffer::new(gl)?;
     let texture_size = layer_config.min_texture_size;
     let layer_config_buffer = Buffer::new(gl)?;
+    let float_color_buffer = gl
+        .get_extension("EXT_color_buffer_float")
+        .map_js_error(WebGlOperation::Context(WebGlContextOperation::Extension))?
+        .is_some()
+        || gl
+            .get_extension("EXT_color_buffer_half_float")
+            .map_js_error(WebGlOperation::Context(WebGlContextOperation::Extension))?
+            .is_some();
+    let intermediate_format = if float_color_buffer {
+        WebGl2RenderingContext::RGBA16F
+    } else {
+        log::warn!("Floating-point color buffers unavailable; layer compositing remains 8-bit");
+        WebGl2RenderingContext::RGBA8
+    };
     upload_layer_config_buffer(
         gl,
         &layer_config_buffer,
@@ -2550,7 +2573,7 @@ fn create_webgl_resources(
     let encoded_paints_texture = create_placeholder_rgba32ui_texture(gl)?;
 
     // Create and configure gradient texture.
-    let gradient_texture = create_placeholder_rgba8_texture(gl)?;
+    let gradient_texture = create_data_texture_storage(gl, WebGl2RenderingContext::RGBA32F, 1, 1)?;
     let placeholder_external_texture = create_placeholder_rgba8_texture(gl)?;
 
     let layer_textures: [Vec<WebGlIntermediateTexture>; 2] = core::array::from_fn(|_| Vec::new());
@@ -2590,6 +2613,7 @@ fn create_webgl_resources(
         copy_vao,
         scratch_texture,
         layer_config_buffer,
+        intermediate_format,
         layer_textures,
     })
 }
@@ -2597,10 +2621,11 @@ fn create_webgl_resources(
 fn create_intermediate_texture(
     gl: &WebGl2RenderingContext,
     size: SizeU16,
+    internal_format: u32,
 ) -> Result<WebGlIntermediateTexture, WebGlError> {
     let texture = create_texture_storage(
         gl,
-        WebGl2RenderingContext::RGBA8,
+        internal_format,
         u32::from(size.width()),
         u32::from(size.height()),
         WebGl2RenderingContext::LINEAR,
