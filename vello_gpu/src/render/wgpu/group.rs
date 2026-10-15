@@ -234,6 +234,7 @@ impl Renderer {
                 *offset += paint_texels;
             }
             paint_texels = *self.paint_idxs.last().unwrap();
+            let first_paint = storage.paints.len();
             storage.paints.append(&mut self.encoded_paints);
             let strips = scene.strip_storage.borrow();
             let alpha_offset =
@@ -253,7 +254,11 @@ impl Renderer {
                 ),
                 false,
             );
-            let resolver = PaintResolver::new(&scene.encoded_paints, &self.paint_idxs)
+            let resolver = PaintResolver::new(
+                &scene.encoded_paints,
+                &self.paint_idxs,
+                &storage.paints[first_paint..],
+            )
                 .with_image_cache(&resources.image_cache);
             let mut builder =
                 DrawBuilder::new(&mut storage.draws[index], &mut storage.buffers, &mut state);
