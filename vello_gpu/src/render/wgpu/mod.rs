@@ -69,6 +69,9 @@ use wgpu::{
     TextureView, TextureViewDescriptor, util::DeviceExt,
 };
 
+/// Render sizes whose config buffers are kept before the cache restarts.
+const MAX_VIEW_CONFIG_BUFFERS: usize = 8;
+
 /// Placeholder value for uninitialized GPU encoded paints.
 const GPU_PAINT_PLACEHOLDER: GpuEncodedPaint = GpuEncodedPaint::LinearGradient(GpuLinearGradient {
     texture_width_and_extend_mode: 0,
@@ -238,10 +241,13 @@ impl Renderer {
     }
 
     /// Finish a frame started with [`Resources::begin_frame`].
+    /// Renders within a frame append to the shared uploads, so they may share one submit.
     /// Submit every render using these resources before calling this: maintenance
     /// can clear atlas regions referenced by those renders.
     pub fn end_frame(&mut self, resources: &mut Resources, _queue: &Queue) {
         resources.end_frame();
+        self.gradient_cache.maintain();
+        self.programs.reset_uploads();
         #[cfg(feature = "text")]
         {
             let result = resources.after_render(self, |renderer, rect| {
@@ -286,6 +292,10 @@ impl Renderer {
         texture_bindings: &TextureBindings,
         target_init: TargetInit<'_>,
     ) -> Result<(), RenderError> {
+        // Outside a frame each render is submitted on its own, so uploads restart.
+        if !resources.frame_active {
+            self.programs.reset_uploads();
+        }
         #[cfg(feature = "text")]
         self.prepare_glyphs(resources, device, queue, encoder, texture_bindings)?;
 
@@ -303,6 +313,10 @@ impl Renderer {
             RootTarget::UserSurface,
             texture_bindings,
         );
+        // Eviction moves gradient ramps, so within a frame it waits for `end_frame`.
+        if !resources.frame_active {
+            self.gradient_cache.maintain();
+        }
 
         #[cfg(feature = "text")]
         resources.after_render(self, |renderer, rect| {
@@ -415,8 +429,7 @@ impl Renderer {
         );
         self.dummy_image_cache = Some(dummy_image_cache);
 
-        // Submit immediately so the atlas content is committed before subsequent
-        // render() calls overwrite the shared alpha/config/paint resources.
+        // Submit immediately so the atlas content is committed before later renders sample it.
         queue.submit(Some(encoder.finish()));
 
         result
@@ -458,6 +471,16 @@ impl Renderer {
             texture_bindings,
             view.texture(),
         )?;
+        let paint_base = self.programs.prepare_paints(
+            device,
+            queue,
+            &self.encoded_paints,
+            *self.paint_idxs.last().unwrap(),
+        );
+        for offset in &mut self.paint_idxs {
+            *offset += paint_base;
+        }
+        self.schedule_storage.filter_context.base = self.programs.filter_base();
         let required_texture_size = self
             .layers_config
             .required_intermediate_texture_size(&scene.recorder)?;
@@ -488,28 +511,28 @@ impl Renderer {
         // TODO: For the time being, we upload the entire alpha buffer as one big chunk. As a future
         // refinement, we could have a bounded alpha buffer, and break draws when the alpha
         // buffer fills.
-        self.programs.prepare(
+        let alpha_offset = self.programs.prepare(
             device,
             queue,
             &mut self.gradient_cache,
-            &self.encoded_paints,
             &mut scene.strip_storage.borrow_mut().alphas,
             render_size,
-            &self.paint_idxs,
             &self.schedule_storage.filter_context,
         );
 
-        let strip_count = self
-            .schedule_storage
-            .buffers
-            .draw_buffers
-            .opaque
-            .strips()
-            .len()
-            + self.schedule_storage.buffers.draw_buffers.strips.len();
+        let draw_buffers = &mut self.schedule_storage.buffers.draw_buffers;
+        if alpha_offset != 0 {
+            for strip in draw_buffers.opaque.strips_mut() {
+                strip.offset_alpha_columns(alpha_offset);
+            }
+            for strip in &mut draw_buffers.strips {
+                strip.offset_alpha_columns(alpha_offset);
+            }
+        }
+        let strip_count = draw_buffers.opaque.strips().len() + draw_buffers.strips.len();
         self.programs
             .strips_arena
-            .begin_frame(device, (strip_count * size_of::<GpuStrip>()) as u64);
+            .reserve(device, (strip_count * size_of::<GpuStrip>()) as u64);
 
         let mut ctx = RendererContext {
             programs: &mut self.programs,
@@ -536,8 +559,6 @@ impl Renderer {
         .unwrap_or_else(|error| match error {});
 
         ctx.finish_root_clear();
-
-        self.gradient_cache.maintain();
 
         Ok(())
     }
@@ -950,7 +971,8 @@ struct Programs {
     /// Copy bind group layout.
     copy_bind_group_layout: BindGroupLayout,
     /// Strip bind group cache.
-    strip_layer_bind_groups: HashMap<(StripTargetKind, Option<LayerTextureId>), BindGroup>,
+    strip_layer_bind_groups:
+        HashMap<(StripTargetKind, Option<LayerTextureId>, Option<(u16, u16)>), BindGroup>,
     /// Blend bind group cache.
     blend_layer_bind_groups: HashMap<BlendPassBindings, BindGroup>,
     /// Filter bind group cache.
@@ -972,6 +994,10 @@ struct Programs {
     resources: GpuResources,
     /// Arena holding all [`GpuStrip`] data.
     strips_arena: StripBufferArena,
+    /// Rows of the alpha, paint and filter textures already filled this frame.
+    alpha_rows: u32,
+    paint_rows: u32,
+    filter_rows: u32,
     flat_group: group::FlatGroupStorage,
     /// Dimensions of the rendering target
     render_size: RenderSize,
@@ -1006,14 +1032,16 @@ impl StripBufferArena {
         }
     }
 
-    fn begin_frame(&mut self, device: &Device, frame_size: u64) {
-        self.cursor = 0;
-        if frame_size > self.capacity {
-            let new_capacity = frame_size
+    /// Ensures `size` more bytes fit after this frame's earlier uploads, starting a fresh buffer otherwise.
+    fn reserve(&mut self, device: &Device, size: u64) {
+        let end = self.cursor.next_multiple_of(COPY_BUFFER_ALIGNMENT) + size;
+        if end > self.capacity {
+            let new_capacity = end
                 .max(self.capacity * 2)
                 .min(device.limits().max_buffer_size);
             self.buffer = create_arena_buffer(device, new_capacity);
             self.capacity = new_capacity;
+            self.cursor = 0;
         }
     }
 
@@ -1022,6 +1050,25 @@ impl StripBufferArena {
         self.cursor = offset + len;
         offset
     }
+}
+
+/// Reserves `rows` after this frame's earlier uploads. Returns the first row and, when they
+/// don't fit, the height of a fresh texture; earlier renders keep reading the old one.
+fn reserve_rows(cursor: &mut u32, rows: u32, height: u32, max_height: u32) -> (u32, Option<u32>) {
+    assert!(
+        rows <= max_height,
+        "Upload exceeds resource texture dimensions"
+    );
+    let mut start = *cursor;
+    let mut new_height = None;
+    if start + rows > height {
+        if start + rows > max_height {
+            start = 0;
+        }
+        new_height = Some((start + rows).max(height * 2).min(max_height));
+    }
+    *cursor = start + rows;
+    (start, new_height)
 }
 
 /// Contains all GPU resources needed for rendering
@@ -1055,8 +1102,8 @@ struct GpuResources {
     filter_base_bind_group: BindGroup,
     /// Intermediate texture size.
     texture_size: SizeU16,
-    /// Root config buffer.
-    view_config_buffer: Buffer,
+    /// Root config buffer for each render size used this frame.
+    view_config_buffers: HashMap<(u16, u16), Buffer>,
     /// Layer config buffer.
     layer_config_buffer: Buffer,
 
@@ -1097,8 +1144,6 @@ impl GpuResources {
         self.scratch_texture.as_ref().unwrap().get()
     }
 }
-
-const SIZE_OF_CONFIG: NonZeroU64 = NonZeroU64::new(size_of::<Config>() as u64).unwrap();
 
 impl GpuStrip {
     /// Vertex attributes for the strip
@@ -1691,11 +1736,15 @@ impl Programs {
             resource_texture_dimension_2d,
             INITIAL_ALPHA_TEXTURE_HEIGHT,
         );
-        let view_config_buffer = Self::create_config_buffer(
-            device,
-            u32::from(render_target_config.width),
-            u32::from(render_target_config.height),
-            resource_texture_dimension_2d,
+        let mut view_config_buffers = HashMap::new();
+        view_config_buffers.insert(
+            (render_target_config.width, render_target_config.height),
+            Self::create_config_buffer(
+                device,
+                u32::from(render_target_config.width),
+                u32::from(render_target_config.height),
+                resource_texture_dimension_2d,
+            ),
         );
 
         let AtlasConfig {
@@ -1790,7 +1839,7 @@ impl Programs {
             filter_data_texture,
             filter_base_bind_group,
             texture_size,
-            view_config_buffer,
+            view_config_buffers,
         };
 
         Self {
@@ -1811,6 +1860,9 @@ impl Programs {
             copy_pipeline,
             resources,
             strips_arena: StripBufferArena::new(device),
+            alpha_rows: 0,
+            paint_rows: 0,
+            filter_rows: 0,
             flat_group: group::FlatGroupStorage::default(),
             encoded_paints_data,
             filter_data,
@@ -2220,150 +2272,41 @@ impl Programs {
 
     /// Prepare GPU buffers for rendering, given alphas.
     ///
-    /// Specifically, updates the alpha texture with `alphas` and the config buffer when
-    /// the rendering size changes.
+    /// Appends `alphas` and the filter data to this frame's uploads, selects the config buffer
+    /// for the render size, and returns the alpha column offset for the scene's strips.
     fn prepare(
         &mut self,
         device: &Device,
         queue: &Queue,
         gradient_cache: &mut GradientRampCache,
-        encoded_paints: &[GpuEncodedPaint],
         alphas: &mut Vec<u8>,
         new_render_size: &RenderSize,
-        paint_idxs: &[u32],
         filter_context: &FilterContext,
-    ) {
+    ) -> u32 {
         let resource_texture_dimension_2d = self.resources.resource_texture_dimension_2d;
-        self.maybe_resize_alphas_tex(device, resource_texture_dimension_2d, alphas.len());
-        self.maybe_resize_encoded_paints_tex(device, resource_texture_dimension_2d, paint_idxs);
-        self.maybe_resize_filter_tex(device, resource_texture_dimension_2d, filter_context);
-        self.maybe_update_config_buffer(queue, resource_texture_dimension_2d, new_render_size);
-
-        self.upload_alpha_texture(queue, alphas);
-        self.upload_encoded_paints_texture(queue, encoded_paints, paint_idxs);
-        self.upload_filter_texture(queue, filter_context);
+        self.maybe_update_config_buffer(device, resource_texture_dimension_2d, new_render_size);
+        let alpha_offset = self.upload_alpha_texture(device, queue, alphas);
+        self.upload_filter_texture(device, queue, filter_context);
 
         if gradient_cache.has_changed() {
             self.maybe_resize_gradient_tex(device, resource_texture_dimension_2d, gradient_cache);
             self.upload_gradient_texture(queue, gradient_cache);
             gradient_cache.mark_synced();
         }
+        alpha_offset
     }
 
-    fn maybe_resize_filter_tex(
-        &mut self,
-        device: &Device,
-        resource_texture_dimension_2d: u32,
-        filter_context: &FilterContext,
-    ) {
-        let Some(required_filter_height) =
-            filter_context.required_filter_data_height(resource_texture_dimension_2d)
-        else {
-            return;
-        };
-        debug_assert!(
-            self.resources.filter_data_texture.width() == resource_texture_dimension_2d,
-            "Filter texture width must match resource texture dimensions"
-        );
-        let current_filter_height = self.resources.filter_data_texture.height();
-        if required_filter_height > current_filter_height {
-            let required_filter_size =
-                (resource_texture_dimension_2d * required_filter_height) << 4;
-            self.filter_data.resize(required_filter_size as usize, 0);
-
-            let filter_texture = Self::create_filter_data_texture(
-                device,
-                resource_texture_dimension_2d,
-                required_filter_height,
-            );
-            self.resources.filter_data_texture = filter_texture;
-            self.resources.filter_base_bind_group = Self::create_filter_base_bind_group(
-                device,
-                &self.filter_bind_group_layout,
-                &self
-                    .resources
-                    .filter_data_texture
-                    .create_view(&TextureViewDescriptor::default()),
-            );
-        }
+    /// Texel offset at which the next scene's filter data is uploaded.
+    fn filter_base(&self) -> u32 {
+        self.filter_rows * self.resources.filter_data_texture.width()
     }
 
-    /// Update the alpha texture size if needed.
-    fn maybe_resize_alphas_tex(
-        &mut self,
-        device: &Device,
-        resource_texture_dimension_2d: u32,
-        alphas_len: usize,
-    ) {
-        let required_alpha_height = u32::try_from(alphas_len)
-            .unwrap()
-            // There are 16 1-byte alpha values per texel.
-            .div_ceil(resource_texture_dimension_2d << 4);
-        debug_assert!(
-            self.resources.alphas_texture.width() == resource_texture_dimension_2d,
-            "Alpha texture width must match resource texture dimensions"
-        );
-        let current_alpha_height = self.resources.alphas_texture.height();
-        if required_alpha_height > current_alpha_height {
-            // We need to resize the alpha texture to fit the new alpha data.
-            assert!(
-                required_alpha_height <= resource_texture_dimension_2d,
-                "Alpha texture height exceeds resource texture dimensions"
-            );
-
-            // The alpha texture encodes 16 1-byte alpha values per texel, with 4 alpha values packed in each channel
-            let alphas_texture = Self::create_alphas_texture(
-                device,
-                resource_texture_dimension_2d,
-                required_alpha_height,
-            );
-            self.resources.alphas_texture = alphas_texture;
-            self.strip_layer_bind_groups.clear();
-            self.blend_layer_bind_groups.clear();
-        }
-    }
-
-    /// Update the encoded paints texture size if needed.
-    fn maybe_resize_encoded_paints_tex(
-        &mut self,
-        device: &Device,
-        resource_texture_dimension_2d: u32,
-        paint_idxs: &[u32],
-    ) {
-        let required_texels = paint_idxs.last().unwrap();
-        let required_encoded_paints_height =
-            required_texels.div_ceil(resource_texture_dimension_2d);
-        debug_assert!(
-            self.resources.encoded_paints_texture.width() == resource_texture_dimension_2d,
-            "Encoded paints texture width must match resource texture dimensions"
-        );
-        let current_encoded_paints_height = self.resources.encoded_paints_texture.height();
-        if required_encoded_paints_height > current_encoded_paints_height {
-            assert!(
-                required_encoded_paints_height <= resource_texture_dimension_2d,
-                "Encoded paints texture height exceeds resource texture dimensions"
-            );
-            let required_encoded_paints_size =
-                (resource_texture_dimension_2d * required_encoded_paints_height) << 4;
-            self.encoded_paints_data
-                .resize(required_encoded_paints_size as usize, 0);
-            let encoded_paints_texture = Self::create_encoded_paints_texture(
-                device,
-                resource_texture_dimension_2d,
-                required_encoded_paints_height,
-            );
-            self.resources.encoded_paints_texture = encoded_paints_texture;
-
-            // Since the encoded paints texture has changed, we need to update the strip bind groups.
-            self.resources.encoded_paints_bind_group = Self::create_encoded_paints_bind_group(
-                device,
-                &self.encoded_paints_bind_group_layout,
-                &self
-                    .resources
-                    .encoded_paints_texture
-                    .create_view(&TextureViewDescriptor::default()),
-            );
-        }
+    /// Restart the uploads once every render using them was submitted.
+    fn reset_uploads(&mut self) {
+        self.alpha_rows = 0;
+        self.paint_rows = 0;
+        self.filter_rows = 0;
+        self.strips_arena.cursor = 0;
     }
 
     /// Update the gradient texture size if needed.
@@ -2404,31 +2347,31 @@ impl Programs {
         }
     }
 
-    /// Update config buffer if dimensions changed.
+    /// Select the config buffer for the render size; renders at other sizes keep theirs.
     fn maybe_update_config_buffer(
         &mut self,
-        queue: &Queue,
+        device: &Device,
         resource_texture_dimension_2d: u32,
         new_render_size: &RenderSize,
     ) {
-        if self.render_size != *new_render_size {
-            let config = Config {
-                width: u32::from(new_render_size.width),
-                height: u32::from(new_render_size.height),
-                strip_height: Tile::HEIGHT.into(),
-                alphas_tex_width_bits: resource_texture_dimension_2d.trailing_zeros(),
-                encoded_paints_tex_width_bits: resource_texture_dimension_2d.trailing_zeros(),
-                strip_offset_x: 0,
-                strip_offset_y: 0,
-                negate_ndc: 0,
-            };
-            let mut buffer = queue
-                .write_buffer_with(&self.resources.view_config_buffer, 0, SIZE_OF_CONFIG)
-                .expect("Buffer only ever holds `Config`");
-            buffer.copy_from_slice(bytemuck::bytes_of(&config));
-
-            self.render_size = new_render_size.clone();
+        let key = (new_render_size.width, new_render_size.height);
+        let buffers = &mut self.resources.view_config_buffers;
+        if !buffers.contains_key(&key) {
+            if buffers.len() >= MAX_VIEW_CONFIG_BUFFERS {
+                buffers.clear();
+                self.strip_layer_bind_groups.clear();
+            }
+            buffers.insert(
+                key,
+                Self::create_config_buffer(
+                    device,
+                    u32::from(key.0),
+                    u32::from(key.1),
+                    resource_texture_dimension_2d,
+                ),
+            );
         }
+        self.render_size = new_render_size.clone();
     }
 
     /// Create any newly allocated atlas textures.
@@ -2460,30 +2403,48 @@ impl Programs {
         )
     }
 
-    /// Upload alpha data to the texture.
-    fn upload_alpha_texture(&mut self, queue: &Queue, alphas: &mut Vec<u8>) {
+    /// Append alpha data to the texture, returning its column offset.
+    fn upload_alpha_texture(
+        &mut self,
+        device: &Device,
+        queue: &Queue,
+        alphas: &mut Vec<u8>,
+    ) -> u32 {
         if alphas.is_empty() {
-            return;
+            return 0;
         }
 
         let texture_width = self.resources.alphas_texture.width();
-        let texture_height = self.resources.alphas_texture.height();
         let row_bytes = (texture_width << 4) as usize;
-        let rows = alphas
-            .len()
-            .div_ceil(row_bytes)
-            .min(texture_height as usize);
+        let rows = u32::try_from(alphas.len().div_ceil(row_bytes)).unwrap();
+        let (start, new_height) = reserve_rows(
+            &mut self.alpha_rows,
+            rows,
+            self.resources.alphas_texture.height(),
+            self.resources.resource_texture_dimension_2d,
+        );
+        if let Some(height) = new_height {
+            // The alpha texture encodes 16 1-byte alpha values per texel, with 4 alpha values packed in each channel
+            self.resources.alphas_texture =
+                Self::create_alphas_texture(device, texture_width, height);
+            self.strip_layer_bind_groups.clear();
+            self.blend_layer_bind_groups.clear();
+        }
 
         let original_len = alphas.len();
 
         // Temporarily pad the last row with zeros before uploading.
-        alphas.resize(rows * row_bytes, 0);
+        alphas.resize(rows as usize * row_bytes, 0);
 
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &self.resources.alphas_texture,
                 mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
+                origin: wgpu::Origin3d {
+                    x: 0,
+                    y: start,
+                    z: 0,
+                },
                 aspect: wgpu::TextureAspect::All,
             },
             alphas,
@@ -2492,94 +2453,148 @@ impl Programs {
                 // 16 bytes per RGBA32Uint texel (4 u32s × 4 bytes each), which is equivalent to
                 // a bit shift of 4.
                 bytes_per_row: Some(texture_width << 4),
-                rows_per_image: Some(rows as u32),
+                rows_per_image: Some(rows),
             },
             Extent3d {
                 width: texture_width,
-                height: rows as u32,
+                height: rows,
                 depth_or_array_layers: 1,
             },
         );
 
         // Truncate back to the original size.
         alphas.truncate(original_len);
+
+        start * (texture_width << 4) / u32::from(Tile::HEIGHT)
     }
 
-    /// Upload encoded paints to the texture.
-    fn upload_encoded_paints_texture(
+    /// Append encoded paints to the texture, returning the texel offset of the first one.
+    fn prepare_paints(
         &mut self,
+        device: &Device,
         queue: &Queue,
         encoded_paints: &[GpuEncodedPaint],
-        paint_idxs: &[u32],
-    ) {
+        texels: u32,
+    ) -> u32 {
         if encoded_paints.is_empty() {
-            return;
+            return 0;
         }
 
-        let encoded_paints_texture = &self.resources.encoded_paints_texture;
-        let encoded_paints_texture_width = encoded_paints_texture.width();
-        let encoded_paints_texture_height = encoded_paints_texture.height();
-
-        let used_texels = *paint_idxs.last().unwrap() as usize;
-        let rows = used_texels
-            .div_ceil(encoded_paints_texture_width as usize)
-            .min(encoded_paints_texture_height as usize);
-
-        GpuEncodedPaint::serialize_to_buffer(
-            encoded_paints,
-            &mut self.encoded_paints_data[..rows * encoded_paints_texture_width as usize * 16],
+        let width = self.resources.encoded_paints_texture.width();
+        let rows = texels.div_ceil(width);
+        let (start, new_height) = reserve_rows(
+            &mut self.paint_rows,
+            rows,
+            self.resources.encoded_paints_texture.height(),
+            self.resources.resource_texture_dimension_2d,
         );
+        if let Some(height) = new_height {
+            self.encoded_paints_data
+                .resize(((width * height) << 4) as usize, 0);
+            self.resources.encoded_paints_texture =
+                Self::create_encoded_paints_texture(device, width, height);
+
+            // Since the encoded paints texture has changed, we need to update the strip bind groups.
+            self.resources.encoded_paints_bind_group = Self::create_encoded_paints_bind_group(
+                device,
+                &self.encoded_paints_bind_group_layout,
+                &self
+                    .resources
+                    .encoded_paints_texture
+                    .create_view(&TextureViewDescriptor::default()),
+            );
+        }
+
+        let data = &mut self.encoded_paints_data[..rows as usize * width as usize * 16];
+        GpuEncodedPaint::serialize_to_buffer(encoded_paints, data);
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
-                texture: encoded_paints_texture,
+                texture: &self.resources.encoded_paints_texture,
                 mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
+                origin: wgpu::Origin3d {
+                    x: 0,
+                    y: start,
+                    z: 0,
+                },
                 aspect: wgpu::TextureAspect::All,
             },
-            &self.encoded_paints_data[..rows * encoded_paints_texture_width as usize * 16],
+            data,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 // 16 bytes per RGBA32Uint texel (4 u32s × 4 bytes each), equivalent to bit shift of 4
-                bytes_per_row: Some(encoded_paints_texture_width << 4),
-                rows_per_image: Some(rows as u32),
+                bytes_per_row: Some(width << 4),
+                rows_per_image: Some(rows),
             },
             Extent3d {
-                width: encoded_paints_texture_width,
-                height: rows as u32,
+                width,
+                height: rows,
                 depth_or_array_layers: 1,
             },
         );
+
+        start * width
     }
 
-    fn upload_filter_texture(&mut self, queue: &Queue, filter_context: &FilterContext) {
+    /// Append filter data to the texture at the offset its scene was scheduled with.
+    fn upload_filter_texture(
+        &mut self,
+        device: &Device,
+        queue: &Queue,
+        filter_context: &FilterContext,
+    ) {
         if filter_context.is_empty() {
             return;
         }
 
-        let filter_texture = &self.resources.filter_data_texture;
-        let width = filter_texture.width();
-        let height = filter_texture.height();
+        let width = self.resources.filter_data_texture.width();
+        let rows = filter_context.total_texels().div_ceil(width);
+        let (start, new_height) = reserve_rows(
+            &mut self.filter_rows,
+            rows,
+            self.resources.filter_data_texture.height(),
+            self.resources.resource_texture_dimension_2d,
+        );
+        assert_eq!(
+            start * width,
+            filter_context.base,
+            "Filter data exceeds resource texture dimensions"
+        );
+        if let Some(height) = new_height {
+            self.filter_data.resize(((width * height) << 4) as usize, 0);
+            self.resources.filter_data_texture =
+                Self::create_filter_data_texture(device, width, height);
+            self.resources.filter_base_bind_group = Self::create_filter_base_bind_group(
+                device,
+                &self.filter_bind_group_layout,
+                &self
+                    .resources
+                    .filter_data_texture
+                    .create_view(&TextureViewDescriptor::default()),
+            );
+        }
 
-        let used_texels = filter_context.total_texels() as usize;
-        let rows = used_texels.div_ceil(width as usize).min(height as usize);
-
-        filter_context.serialize_to_buffer(&mut self.filter_data[..rows * width as usize * 16]);
+        let data = &mut self.filter_data[..rows as usize * width as usize * 16];
+        filter_context.serialize_to_buffer(data);
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
-                texture: filter_texture,
+                texture: &self.resources.filter_data_texture,
                 mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
+                origin: wgpu::Origin3d {
+                    x: 0,
+                    y: start,
+                    z: 0,
+                },
                 aspect: wgpu::TextureAspect::All,
             },
-            &self.filter_data[..rows * width as usize * 16],
+            data,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(width << 4),
-                rows_per_image: Some(rows as u32),
+                rows_per_image: Some(rows),
             },
             Extent3d {
                 width,
-                height: rows as u32,
+                height: rows,
                 depth_or_array_layers: 1,
             },
         );
@@ -2801,19 +2816,25 @@ impl RendererContext<'_> {
             // For layer targets we always want to load.
             wgpu::LoadOp::Load
         };
-        let (view, config_buffer, bind_group_target) = match target {
+        let root_size = (
+            self.programs.render_size.width,
+            self.programs.render_size.height,
+        );
+        let (view, config_buffer, bind_group_target, config_size) = match target {
             DrawPassTarget::Root(_) => (
                 self.view,
-                &self.programs.resources.view_config_buffer,
+                &self.programs.resources.view_config_buffers[&root_size],
                 StripTargetKind::Root,
+                Some(root_size),
             ),
             DrawPassTarget::Layer(id) => (
                 self.programs.resources.layer_view(id),
                 &self.programs.resources.layer_config_buffer,
                 StripTargetKind::Layer,
+                None,
             ),
         };
-        let bind_group_key = (bind_group_target, child_layer_texture);
+        let bind_group_key = (bind_group_target, child_layer_texture, config_size);
         if !self
             .programs
             .strip_layer_bind_groups

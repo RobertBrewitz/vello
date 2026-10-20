@@ -444,6 +444,8 @@ pub(crate) struct FilterContext {
     /// The encoded data for each filter used in the current scene that will be uploaded to the
     /// filter data texture.
     filters: Vec<GpuFilterData>,
+    /// Texel offset of this scene's filter data within the frame's uploads.
+    pub(crate) base: u32,
 }
 
 /// Offset and encoded parameters for one filter recorded in [`FilterContext`].
@@ -679,7 +681,7 @@ impl FilterContext {
         filter_data: &FilterData,
         source_bounds: RectU16,
     ) -> PreparedGpuFilter {
-        let data_offset = self.total_texels();
+        let data_offset = self.base + self.total_texels();
         let prepared = PreparedFilter::new(&filter_data.filter, &filter_data.transform);
         let mut data = GpuFilterData::from(&prepared);
         if data.filter_type() == filter_type::BLUR_AXES {
@@ -716,6 +718,7 @@ impl FilterContext {
 
     /// Calculate the required height for the filter data texture.
     /// Returns `None` if no filters are present.
+    #[cfg(any(feature = "webgl", test))]
     pub(crate) fn required_filter_data_height(
         &self,
         resource_texture_dimension_2d: u32,
@@ -790,6 +793,7 @@ mod tests {
     fn filter_data_height_must_fit_resource_texture_limit() {
         let context = FilterContext {
             filters: alloc::vec![gpu_offset()],
+            base: 0,
         };
 
         let _ = context.required_filter_data_height(1);

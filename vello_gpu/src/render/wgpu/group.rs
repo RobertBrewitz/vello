@@ -16,6 +16,7 @@ const MAX_GROUP_STRIPS: usize = 65536;
 #[derive(Debug, Default)]
 pub(super) struct FlatGroupStorage {
     paints: Vec<GpuEncodedPaint>,
+    paint_idxs: Vec<u32>,
     alphas: Vec<u8>,
     buffers: DrawBuffers,
     draws: Vec<Draw>,
@@ -26,6 +27,7 @@ pub(super) struct FlatGroupStorage {
 impl FlatGroupStorage {
     fn clear(&mut self) {
         self.paints.clear();
+        self.paint_idxs.clear();
         self.alphas.clear();
         self.buffers.clear();
         for draw in &mut self.draws {
@@ -37,7 +39,7 @@ impl FlatGroupStorage {
 }
 
 /// Prepared SDR scenes whose uploads remain immutable while drawing the group.
-/// Drop this handle and submit its encoder before preparing any further renders.
+/// Later renders in the frame append to the uploads, so the group may share their submit.
 #[derive(Debug)]
 pub struct PreparedFlatGroup<'a> {
     renderer: &'a mut Renderer,
@@ -92,7 +94,6 @@ impl PreparedFlatGroup<'_> {
 
 impl Drop for PreparedFlatGroup<'_> {
     fn drop(&mut self) {
-        self.renderer.gradient_cache.maintain();
         self.storage.clear();
         self.renderer.programs.flat_group = core::mem::take(&mut self.storage);
     }
@@ -102,8 +103,7 @@ impl Renderer {
     /// Prepare a bounded prefix of flat, closed, source-over scenes without depth.
     /// Returns `None` if the first scene is unsupported or exceeds the upload budget.
     /// Use ordinary rendering for that scene, then resume grouping subsequent scenes.
-    /// Returns `None` outside an explicit resource frame. Submit the encoder after dropping the group
-    /// and before another renderer operation can overwrite its shared uploads.
+    /// Returns `None` outside an explicit resource frame. Submit the encoder before `end_frame`.
     pub fn prepare_flat_group<'a>(
         &'a mut self,
         scenes: &[&Scene],
@@ -138,7 +138,6 @@ impl Renderer {
         ) {
             storage.clear();
             self.programs.flat_group = storage;
-            self.gradient_cache.maintain();
             return Err(error);
         }
         Ok(Some(PreparedFlatGroup {
@@ -223,7 +222,7 @@ impl Renderer {
             .draws
             .resize_with(storage.draws.len().max(scenes.len()), Draw::default);
         let mut paint_texels = 0;
-        for (index, scene) in scenes.iter().enumerate() {
+        for scene in scenes {
             self.prepare_gpu_encoded_paints(
                 &scene.encoded_paints,
                 &resources.image_cache,
@@ -234,8 +233,18 @@ impl Renderer {
                 *offset += paint_texels;
             }
             paint_texels = *self.paint_idxs.last().unwrap();
-            let first_paint = storage.paints.len();
             storage.paints.append(&mut self.encoded_paints);
+            storage.paint_idxs.extend_from_slice(&self.paint_idxs);
+        }
+        let paint_base = self
+            .programs
+            .prepare_paints(device, queue, &storage.paints, paint_texels);
+        for offset in &mut storage.paint_idxs {
+            *offset += paint_base;
+        }
+        let (mut first_paint, mut first_idx) = (0, 0);
+        for (index, scene) in scenes.iter().enumerate() {
+            let paint_count = scene.encoded_paints.len();
             let strips = scene.strip_storage.borrow();
             let alpha_offset =
                 u32::try_from(storage.alphas.len() / usize::from(Tile::HEIGHT)).unwrap();
@@ -256,10 +265,10 @@ impl Renderer {
             );
             let resolver = PaintResolver::new(
                 &scene.encoded_paints,
-                &self.paint_idxs,
-                &storage.paints[first_paint..],
+                &storage.paint_idxs[first_idx..=first_idx + paint_count],
+                &storage.paints[first_paint..first_paint + paint_count],
             )
-                .with_image_cache(&resources.image_cache);
+            .with_image_cache(&resources.image_cache);
             let mut builder =
                 DrawBuilder::new(&mut storage.draws[index], &mut storage.buffers, &mut state);
             for node in &scene.recorder.nodes {
@@ -274,23 +283,31 @@ impl Renderer {
                 (first * size_of::<GpuStrip>()) as u64
                     ..(storage.buffers.strips.len() * size_of::<GpuStrip>()) as u64,
             );
+            first_paint += paint_count;
+            first_idx += paint_count + 1;
         }
-        self.programs.prepare(
+        let group_alpha_offset = self.programs.prepare(
             device,
             queue,
             &mut self.gradient_cache,
-            &storage.paints,
             &mut storage.alphas,
             render_size,
-            &[paint_texels],
             &FilterContext::default(),
         );
+        if group_alpha_offset != 0 {
+            for strip in &mut storage.buffers.strips {
+                strip.offset_alpha_columns(group_alpha_offset);
+            }
+        }
         let bytes = bytemuck::cast_slice(&storage.buffers.strips);
-        self.programs
-            .strips_arena
-            .begin_frame(device, bytes.len() as u64);
+        let arena = &mut self.programs.strips_arena;
+        arena.reserve(device, bytes.len() as u64);
+        let offset = arena.alloc(bytes.len() as u64);
         if !bytes.is_empty() {
-            queue.write_buffer(&self.programs.strips_arena.buffer, 0, bytes);
+            queue.write_buffer(&arena.buffer, offset, bytes);
+        }
+        for range in &mut storage.ranges {
+            *range = range.start + offset..range.end + offset;
         }
         Ok(())
     }

@@ -103,6 +103,11 @@ impl OpaqueDraw {
         &self.strips
     }
 
+    #[cfg(feature = "wgpu")]
+    pub(crate) fn strips_mut(&mut self) -> &mut [GpuStrip] {
+        &mut self.strips
+    }
+
     pub(crate) fn external_texture_runs(&self) -> &[ExternalTextureRun] {
         &self.external_texture_runs
     }
