@@ -23,7 +23,7 @@ use vello_common::geometry::{RectU16, SizeU16};
 use vello_common::kurbo::{Affine, BezPath, Rect, Shape, Stroke};
 use vello_common::mask::Mask;
 use vello_common::multi_atlas::AtlasConfig;
-use vello_common::paint::{Paint, PaintType, PremulColor, Tint};
+use vello_common::paint::{IndexedPaint, Paint, PaintType, PremulColor, Tint};
 #[cfg(feature = "text")]
 use vello_common::peniko::FontData;
 use vello_common::peniko::color::palette::css::BLACK;
@@ -926,6 +926,59 @@ impl Scene {
         }
     }
 
+    /// Move `other`'s finished recording into the active layer, then reset `other`.
+    /// Both scenes must share a size; `self` must not be inside a clip path or filter layer.
+    pub fn append(&mut self, other: &mut Scene) {
+        assert_eq!(
+            (self.width, self.height),
+            (other.width, other.height),
+            "Appended scenes must share a size"
+        );
+        assert!(
+            self.viewport_state.clip().is_none(),
+            "Cannot append inside a clip path"
+        );
+        assert!(
+            !other.has_open_layers(),
+            "Close all layers before appending"
+        );
+        let paint_offset = self.encoded_paints.len();
+        self.encoded_paints.append(&mut other.encoded_paints);
+        let strip_offset = {
+            let mut storage = self.strip_storage.borrow_mut();
+            let other_storage = other.strip_storage.borrow();
+            let strip_offset = storage.strips.len();
+            let alpha_offset = u32::try_from(storage.alphas.len()).unwrap();
+            storage
+                .strips
+                .extend(other_storage.strips.iter().map(|strip| {
+                    let mut strip = *strip;
+                    strip.set_alpha_idx(strip.alpha_idx() + alpha_offset);
+                    strip
+                }));
+            storage.alphas.extend_from_slice(&other_storage.alphas);
+            strip_offset
+        };
+        let shift_paint = |paint: &mut Paint| {
+            if let Paint::Indexed(indexed) = paint {
+                *indexed = IndexedPaint::new(indexed.index() + paint_offset);
+            }
+        };
+        self.recorder
+            .append(&mut other.recorder, strip_offset, |mut draw| {
+                match &mut draw {
+                    RecordedDraw::Path(path) => {
+                        path.strips =
+                            path.strips.start + strip_offset..path.strips.end + strip_offset;
+                        shift_paint(&mut path.paint);
+                    }
+                    RecordedDraw::Rect(rect) => shift_paint(&mut rect.paint),
+                }
+                draw
+            });
+        other.reset();
+    }
+
     /// Reset the scene and update its size.
     pub fn reset_and_resize(&mut self, width: u16, height: u16) {
         self.width = width;
@@ -1083,6 +1136,53 @@ mod tests {
         };
         assert_eq!(rect.rect, Rect::new(20.5, 20.25, 50.5, 60.75));
         assert!(scene.strip_storage.borrow().strips.is_empty());
+    }
+
+    #[test]
+    fn append_shifts_strips_draws_and_layers() {
+        use vello_common::kurbo::Shape;
+        use vello_common::peniko::{BlendMode, Compose, Mix};
+
+        let circle = |x| vello_common::kurbo::Circle::new((x, 20.0), 10.0).to_path(0.1);
+        let mut scene = Scene::new(64, 64);
+        scene.set_paint(BLUE);
+        scene.fill_path(&circle(20.0));
+        let (strips_before, alphas_before) = {
+            let storage = scene.strip_storage.borrow();
+            (storage.strips.len(), storage.alphas.len() as u32)
+        };
+
+        let mut other = Scene::new(64, 64);
+        other.push_blend_layer(BlendMode::new(Mix::Multiply, Compose::SrcOver));
+        other.push_clip_layer(&circle(40.0));
+        other.set_paint(BLUE);
+        other.fill_path(&circle(44.0));
+        other.pop_layer();
+        other.pop_layer();
+        let other_strips = other.strip_storage.borrow().strips.clone();
+
+        scene.push_opacity_layer(0.5);
+        scene.append(&mut other);
+        scene.pop_layer();
+
+        assert!(other.recorder.draws.is_empty());
+        assert!(other.strip_storage.borrow().is_empty());
+        let storage = scene.strip_storage.borrow();
+        for (appended, original) in storage.strips[strips_before..].iter().zip(&other_strips) {
+            assert_eq!(appended.alpha_idx(), original.alpha_idx() + alphas_before);
+        }
+        let RecordedDraw::Path(path) = &scene.recorder.draws[1] else {
+            panic!("expected the appended path");
+        };
+        assert!(path.strips.start >= strips_before);
+        // Opacity layer 0 holds the appended multiply layer 1, which holds clip layer 2.
+        assert_eq!(scene.recorder.layers.len(), 3);
+        assert_eq!(scene.recorder.layers[1].depth, 2);
+        assert_eq!(scene.recorder.layers[1].nodes[0].layer, Some(2));
+        let clip = scene.recorder.layers[2].props.clip_path.as_ref().unwrap();
+        assert!(clip.strip_range.start >= strips_before);
+        assert_eq!(scene.recorder.max_layer_depth, 3);
+        assert!(!scene.root_is_blend_target());
     }
 
     #[test]

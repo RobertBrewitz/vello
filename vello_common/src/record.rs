@@ -368,6 +368,62 @@ impl<D> CommandRecorder<D> {
         popped_layer
     }
 
+    /// Move a finished recording into the active layer. `map_draw` must shift the draw's
+    /// strip and paint references; clip strip ranges are shifted by `strip_offset`.
+    pub fn append(&mut self, other: &mut Self, strip_offset: usize, map_draw: impl FnMut(D) -> D) {
+        assert!(
+            other.layer_stack.is_empty(),
+            "Close all layers before appending"
+        );
+        assert!(
+            self.layer_stack.iter().all(|open| matches!(
+                self.layers[open.id as usize].kind,
+                RecordedLayerKind::Regular
+            )),
+            "Cannot append inside a filter layer"
+        );
+        let draw_offset = self.draws.len() as u32;
+        let layer_offset = self.layers.len() as u32;
+        let depth = self.layer_stack.len();
+        let remap = |node: Node| Node {
+            draws: node.draws.start + draw_offset..node.draws.end + draw_offset,
+            layer: node.layer.map(|id| id + layer_offset),
+        };
+
+        self.draws.extend(other.draws.drain(..).map(map_draw));
+        for mut layer in other.layers.drain(..) {
+            layer.depth += depth;
+            layer.nodes = layer.nodes.into_iter().map(remap).collect();
+            if let Some(clip) = &mut layer.props.clip_path {
+                clip.strip_range =
+                    clip.strip_range.start + strip_offset..clip.strip_range.end + strip_offset;
+            }
+            self.layers.push(layer);
+        }
+        self.filter_layers
+            .extend(other.filter_layers.drain(..).map(|id| id + layer_offset));
+        for node in other.nodes.drain(..) {
+            self.push_node(remap(node));
+        }
+
+        if self.active_layer.is_none() && other.root_is_blend_target {
+            self.root_is_blend_target = true;
+        }
+        self.has_non_default_blend |= other.has_non_default_blend;
+        self.max_layer_depth = self.max_layer_depth.max(other.max_layer_depth + depth);
+        let max = |a: Option<SizeU16>, b: Option<SizeU16>| match (a, b) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+        self.largest_layer_size = max(self.largest_layer_size, other.largest_layer_size);
+        self.largest_filter_layer_size = max(
+            self.largest_filter_layer_size,
+            other.largest_filter_layer_size,
+        );
+        let bounds = other.content_bounds;
+        self.record_bbox(|| Some(bounds));
+    }
+
     #[inline]
     fn active_node_mut(&mut self) -> Option<&mut Node> {
         if let Some(id) = self.active_layer {
