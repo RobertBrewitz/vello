@@ -69,6 +69,15 @@ With 1–3 done the frame becomes: background, world, a Multiply layer of `ambie
   (`MAX_GROUP_DRAWS`, encoded paint size) and that the f16 payload doesn't regress the perf
   app's baseline.
 
+## 5. What stays outside Vello
+
+- The present pass is irreducible: exposure, tone mapping, dither and sRGB encode into the
+  8-bit swapchain have no blend-mode equivalent. Moving it into `vello_gpu` as an output
+  transform only relocates the shader.
+- Colour grading (contrast, saturation; `color_grading.wesl`) needs either that pass or a
+  filter layer. `vello_common` defines `ColorMatrix` / `Contrast`; check `vello_gpu`
+  implements them before relying on it. A filter layer is still a full-screen pass.
+
 ## Done
 
 - `Scene::append` (5514eb1d): merge separately recorded scenes into one render.
