@@ -3018,6 +3018,10 @@ impl RendererContext<'_> {
                     .push(GpuBlendInstance::new(blend, None, texture_size));
             }
         }
+        // A clip with no strips in this pass leaves nothing to blend.
+        if self.scratch_buffers.blend_instances.is_empty() {
+            return;
+        }
 
         let instance_count = u32::try_from(self.scratch_buffers.blend_instances.len()).unwrap();
         let instance_buffer = self
