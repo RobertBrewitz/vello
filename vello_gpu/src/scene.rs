@@ -55,6 +55,8 @@ pub(crate) struct RecordedPath {
     pub(crate) strips: Range<usize>,
     /// Paint applied to the path.
     pub(crate) paint: Paint,
+    /// Fixed-function blend replacing source-over, if any.
+    pub(crate) hardware_blend: Option<HardwareBlend>,
 }
 
 /// Recorded rectangle and its paint.
@@ -64,16 +66,44 @@ pub(crate) struct RecordedRect {
     pub(crate) rect: Rect,
     /// Paint applied to the rectangle.
     pub(crate) paint: Paint,
+    /// Fixed-function blend replacing source-over, if any.
+    pub(crate) hardware_blend: Option<HardwareBlend>,
 }
 
 impl RecordedDraw {
-    fn new_path(strips: Range<usize>, paint: Paint) -> Self {
-        Self::Path(RecordedPath { strips, paint })
+    fn new_path(strips: Range<usize>, paint: Paint, hardware_blend: Option<HardwareBlend>) -> Self {
+        Self::Path(RecordedPath {
+            strips,
+            paint,
+            hardware_blend,
+        })
     }
 
-    fn new_rect(rect: Rect, paint: Paint) -> Self {
-        Self::Rect(RecordedRect { rect, paint })
+    fn new_rect(rect: Rect, paint: Paint, hardware_blend: Option<HardwareBlend>) -> Self {
+        Self::Rect(RecordedRect {
+            rect,
+            paint,
+            hardware_blend,
+        })
     }
+}
+
+/// A blend the GPU's fixed-function blending applies to each draw directly, without the layer a
+/// [`BlendMode`] other than source-over costs. Set with [`Scene::set_hardware_blend`].
+///
+/// Both act on premultiplied values. [`Add`](Self::Add) matches [`Compose::Plus`] but is not
+/// clamped, so values can exceed 1 on float targets. [`Max`](Self::Max) takes the per-channel
+/// maximum, alpha included: it matches [`Mix::Lighten`] where both colors are opaque, and comes
+/// out darker where a partly covered edge meets a brighter backdrop.
+///
+/// [`Compose::Plus`]: vello_common::peniko::Compose::Plus
+/// [`Mix::Lighten`]: vello_common::peniko::Mix::Lighten
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum HardwareBlend {
+    /// Adds the draw to the target.
+    Add,
+    /// Keeps the per-channel maximum of the draw and the target.
+    Max,
 }
 
 impl Drawable for RecordedDraw {
@@ -264,6 +294,8 @@ pub struct Scene {
     filter: Option<Filter>,
     /// The command recorder.
     pub(crate) recorder: CommandRecorder<RecordedDraw>,
+    /// Fixed-function blend for subsequent draws.
+    hardware_blend: Option<HardwareBlend>,
 }
 
 impl Scene {
@@ -289,6 +321,7 @@ impl Scene {
             strip_storage: RefCell::new(StripStorage::new(GenerationMode::Append)),
             filter: None,
             recorder: CommandRecorder::new(width, height),
+            hardware_blend: None,
         }
     }
 
@@ -527,8 +560,10 @@ impl Scene {
             };
 
             if let Some(bounds) = ctx.fast_rect_bounds(rect) {
-                ctx.recorder
-                    .push_draw(RecordedDraw::new_rect(bounds, paint), &[]);
+                ctx.recorder.push_draw(
+                    RecordedDraw::new_rect(bounds, paint, ctx.hardware_blend),
+                    &[],
+                );
 
                 return;
             }
@@ -575,7 +610,7 @@ impl Scene {
             return;
         }
 
-        let draw = RecordedDraw::new_path(strips.clone(), paint);
+        let draw = RecordedDraw::new_path(strips.clone(), paint, self.hardware_blend);
         let strip_storage = self.strip_storage.borrow();
         self.recorder.push_draw(draw, &strip_storage.strips[strips]);
     }
@@ -655,8 +690,10 @@ impl Scene {
             };
 
             if let Some(bounds) = ctx.fast_rect_bounds(&inflated_rect) {
-                ctx.recorder
-                    .push_draw(RecordedDraw::new_rect(bounds, paint), &[]);
+                ctx.recorder.push_draw(
+                    RecordedDraw::new_rect(bounds, paint, ctx.hardware_blend),
+                    &[],
+                );
                 return;
             }
 
@@ -824,6 +861,18 @@ impl Scene {
         self.render_state.blend_mode = blend_mode;
     }
 
+    /// Blend subsequent fills and strokes with the GPU's fixed-function blending instead of
+    /// source-over, without a layer per draw. `None` restores source-over. Not supported in
+    /// scenes rendered into the image atlas.
+    ///
+    /// # Panics
+    ///
+    /// Drawing panics while both a hardware blend and a [`BlendMode`] other than source-over are
+    /// set.
+    pub fn set_hardware_blend(&mut self, blend: Option<HardwareBlend>) {
+        self.hardware_blend = blend;
+    }
+
     /// Set the stroke settings for subsequent stroke operations.
     pub fn set_stroke(&mut self, stroke: Stroke) {
         self.render_state.stroke = stroke;
@@ -914,6 +963,10 @@ impl Scene {
     {
         let blend_mode = self.render_state.blend_mode;
         let blend_mode = (blend_mode != BlendMode::default()).then_some(blend_mode);
+        assert!(
+            blend_mode.is_none() || self.hardware_blend.is_none(),
+            "a hardware blend replaces source-over and cannot combine with a blend mode"
+        );
         let filter = self.filter.clone();
 
         if blend_mode.is_some() || filter.is_some() {
@@ -1001,6 +1054,7 @@ impl Scene {
         self.aliasing_threshold = None;
         self.recorder.reset(self.width, self.height);
         self.filter = None;
+        self.hardware_blend = None;
     }
 
     /// Get the width of the render context.
@@ -1118,6 +1172,7 @@ mod tests {
         let draw = RecordedDraw::new_rect(
             Rect::new(0.0, 0.0, 4.5, 4.5),
             Paint::Solid(PremulColor::from_alpha_color(BLUE)),
+            None,
         );
 
         assert_eq!(draw.bbox(&[]), Some(RectU16::new(0, 0, 8, 8)));

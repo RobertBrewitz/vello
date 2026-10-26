@@ -11,6 +11,7 @@ only break in edge cases, and some of them are also only related to conversions 
 
 use crate::draw::{EXTERNAL_TEXTURE_SLOT_COUNT, ExternalTextureBindings, ExternalTextureRun};
 use crate::render::common::IMAGE_PADDING;
+use crate::scene::HardwareBlend;
 mod group;
 pub use group::{MAX_FLAT_GROUP_SCENES, PreparedFlatGroup};
 
@@ -936,16 +937,51 @@ fn clear_atlas_region(queue: &Queue, renderer: &mut Renderer, rect: &PendingClea
     );
 }
 
+/// A strip pipeline's variants for each [`HardwareBlend`].
+#[derive(Debug)]
+struct HardwareBlendPipelines {
+    add: RenderPipeline,
+    max: RenderPipeline,
+}
+
+impl HardwareBlendPipelines {
+    fn get(&self, blend: HardwareBlend) -> &RenderPipeline {
+        match blend {
+            HardwareBlend::Add => &self.add,
+            HardwareBlend::Max => &self.max,
+        }
+    }
+}
+
+/// Fixed-function state for a [`HardwareBlend`] on premultiplied values.
+fn hardware_blend_state(blend: HardwareBlend) -> BlendState {
+    let component = wgpu::BlendComponent {
+        src_factor: wgpu::BlendFactor::One,
+        dst_factor: wgpu::BlendFactor::One,
+        operation: match blend {
+            HardwareBlend::Add => wgpu::BlendOperation::Add,
+            HardwareBlend::Max => wgpu::BlendOperation::Max,
+        },
+    };
+    BlendState {
+        color: component,
+        alpha: component,
+    }
+}
+
 /// Defines the GPU resources and pipelines for rendering.
 #[derive(Debug)]
 struct Programs {
     /// Intermediate strip pipeline.
     intermediate_strip_pipeline: RenderPipeline,
+    intermediate_blend_pipelines: HardwareBlendPipelines,
     atlas_strip_pipeline: RenderPipeline,
     /// Root alpha-strip pipeline.
     alpha_strip_pipeline: RenderPipeline,
+    alpha_blend_pipelines: HardwareBlendPipelines,
     /// Root alpha-strip pipeline with depth testing.
     depth_alpha_strip_pipeline: RenderPipeline,
+    depth_alpha_blend_pipelines: HardwareBlendPipelines,
     /// Root opaque-strip pipeline.
     opaque_strip_pipeline: RenderPipeline,
     /// Whether the depth buffer has been cleared this frame.
@@ -1370,6 +1406,38 @@ impl Programs {
             render_target_config.format,
             None,
             Some(depth_stencil(true)),
+        );
+
+        let blend_pipelines = |label, format, depth_stencil: Option<wgpu::DepthStencilState>| {
+            HardwareBlendPipelines {
+                add: create_strip_pipeline(
+                    label,
+                    format,
+                    Some(hardware_blend_state(HardwareBlend::Add)),
+                    depth_stencil.clone(),
+                ),
+                max: create_strip_pipeline(
+                    label,
+                    format,
+                    Some(hardware_blend_state(HardwareBlend::Max)),
+                    depth_stencil,
+                ),
+            }
+        };
+        let intermediate_blend_pipelines = blend_pipelines(
+            "Strip Intermediate Hardware Blend Pipeline",
+            wgpu::TextureFormat::Rgba16Float,
+            None,
+        );
+        let alpha_blend_pipelines = blend_pipelines(
+            "Strip Alpha Hardware Blend Pipeline",
+            render_target_config.format,
+            None,
+        );
+        let depth_alpha_blend_pipelines = blend_pipelines(
+            "Strip Depth Alpha Hardware Blend Pipeline",
+            render_target_config.format,
+            Some(depth_stencil(false)),
         );
 
         let clear_vertex_state = wgpu::VertexBufferLayout {
@@ -1844,10 +1912,13 @@ impl Programs {
 
         Self {
             intermediate_strip_pipeline,
+            intermediate_blend_pipelines,
             atlas_strip_pipeline,
             atlas_rect_clear_pipeline,
             alpha_strip_pipeline,
+            alpha_blend_pipelines,
             depth_alpha_strip_pipeline,
+            depth_alpha_blend_pipelines,
             opaque_strip_pipeline,
             depth_cleared_this_frame: false,
             strip_bind_group_layout,
@@ -2913,34 +2984,48 @@ impl RendererContext<'_> {
                 .slice(strips_range.clone()),
         );
 
-        let draw_strip_runs = |render_pass: &mut wgpu::RenderPass<'_>, first_instance, count| {
-            if external_texture_runs.is_empty() {
-                render_pass.set_bind_group(
-                    1,
-                    &self.programs.resources.empty_external_texture_bind_group,
-                    &[],
-                );
-                render_pass.draw(0..4, first_instance..first_instance + count);
+        // Source-over, and the hardware blend variants when the alpha pass has them.
+        let draw_strip_runs =
+            |render_pass: &mut wgpu::RenderPass<'_>,
+             first_instance,
+             count,
+             pipelines: Option<(&RenderPipeline, &HardwareBlendPipelines)>| {
+                if external_texture_runs.is_empty() {
+                    render_pass.set_bind_group(
+                        1,
+                        &self.programs.resources.empty_external_texture_bind_group,
+                        &[],
+                    );
+                    render_pass.draw(0..4, first_instance..first_instance + count);
 
-                return;
-            }
+                    return;
+                }
 
-            // Each run is drawn with different external texture bindings. Runs go from
-            // `run.strips_start` to the next run's `strips_start`; the last run goes to the end of
-            // the strips buffer.
-            for (i, run) in external_texture_runs.iter().enumerate() {
-                let external_texture_bind_group = self
-                    .external_texture_bind_groups
-                    .get(&run.bindings)
-                    .unwrap();
-                render_pass.set_bind_group(1, external_texture_bind_group, &[]);
-                let start = u32::try_from(run.strips_start).unwrap();
-                let end = external_texture_runs
-                    .get(i + 1)
-                    .map_or(count, |next| u32::try_from(next.strips_start).unwrap());
-                render_pass.draw(0..4, first_instance + start..first_instance + end);
-            }
-        };
+                // Each run is drawn with different external texture bindings. Runs go from
+                // `run.strips_start` to the next run's `strips_start`; the last run goes to the end of
+                // the strips buffer.
+                let mut current_blend = None;
+                for (i, run) in external_texture_runs.iter().enumerate() {
+                    if run.blend != current_blend {
+                        let (source_over, blended) =
+                            pipelines.expect("hardware blends are not supported for this target");
+                        render_pass.set_pipeline(
+                            run.blend.map_or(source_over, |blend| blended.get(blend)),
+                        );
+                        current_blend = run.blend;
+                    }
+                    let external_texture_bind_group = self
+                        .external_texture_bind_groups
+                        .get(&run.bindings)
+                        .unwrap();
+                    render_pass.set_bind_group(1, external_texture_bind_group, &[]);
+                    let start = u32::try_from(run.strips_start).unwrap();
+                    let end = external_texture_runs
+                        .get(i + 1)
+                        .map_or(count, |next| u32::try_from(next.strips_start).unwrap());
+                    render_pass.draw(0..4, first_instance + start..first_instance + end);
+                }
+            };
 
         if opaque_count > 0 {
             // Opaque pass
@@ -2949,25 +3034,38 @@ impl RendererContext<'_> {
                 "opaque strips require the final view depth attachment"
             );
             render_pass.set_pipeline(&self.programs.opaque_strip_pipeline);
-            draw_strip_runs(&mut render_pass, 0, opaque_count);
+            draw_strip_runs(&mut render_pass, 0, opaque_count, None);
         }
 
         if alpha_count > 0 {
             // Alpha pass
-            if matches!(target, DrawPassTarget::Root(RootTarget::UserSurface)) {
-                let pipeline = if enable_opaque {
-                    &self.programs.depth_alpha_strip_pipeline
+            let pipelines = if matches!(target, DrawPassTarget::Root(RootTarget::UserSurface)) {
+                Some(if enable_opaque {
+                    (
+                        &self.programs.depth_alpha_strip_pipeline,
+                        &self.programs.depth_alpha_blend_pipelines,
+                    )
                 } else {
-                    &self.programs.alpha_strip_pipeline
-                };
-                render_pass.set_pipeline(pipeline);
+                    (
+                        &self.programs.alpha_strip_pipeline,
+                        &self.programs.alpha_blend_pipelines,
+                    )
+                })
             } else if matches!(target, DrawPassTarget::Root(_)) {
-                render_pass.set_pipeline(&self.programs.atlas_strip_pipeline);
+                None
             } else {
-                render_pass.set_pipeline(&self.programs.intermediate_strip_pipeline);
-            }
+                Some((
+                    &self.programs.intermediate_strip_pipeline,
+                    &self.programs.intermediate_blend_pipelines,
+                ))
+            };
+            render_pass.set_pipeline(
+                pipelines.map_or(&self.programs.atlas_strip_pipeline, |(pipeline, _)| {
+                    pipeline
+                }),
+            );
 
-            draw_strip_runs(&mut render_pass, opaque_count, alpha_count);
+            draw_strip_runs(&mut render_pass, opaque_count, alpha_count, pipelines);
         }
     }
 

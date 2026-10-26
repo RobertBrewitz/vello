@@ -136,7 +136,7 @@ pub use render::{ClearSettings, Config, GpuStrip, RenderSize, TargetInit};
 #[cfg(all(feature = "webgl", feature = "probe"))]
 pub use render::{WebGlPendingProbe, WebGlProbeError, WebGlProbeOperation, WebGlProbeStatus};
 pub use resources::Resources;
-pub use scene::{LayersConfig, MemorySettings, RenderSettings, Scene};
+pub use scene::{HardwareBlend, LayersConfig, MemorySettings, RenderSettings, Scene};
 #[cfg(feature = "text")]
 pub use text::{GlyphRunBuilder, GpuGlyphRunBackend};
 pub use util::DimensionConstraints;

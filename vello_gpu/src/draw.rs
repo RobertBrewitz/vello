@@ -9,7 +9,7 @@ use crate::paint::{
     TextureSourceId,
 };
 use crate::rect::{RectPart, split_rect};
-use crate::scene::{RecordedDraw, RecordedPath};
+use crate::scene::{HardwareBlend, RecordedDraw, RecordedPath};
 use crate::target::{DrawTarget, LayerTextureRegion};
 use crate::util::{Ranges, VecExt, pack_opacity, pack_u16_pair};
 use alloc::vec::Vec;
@@ -27,7 +27,7 @@ use vello_common::util::Clear;
 pub(crate) struct Draw {
     /// Ranges selecting this draw's strips from [`DrawBuffers::strips`].
     pub(crate) strip_ranges: Ranges,
-    /// Runs that require external texture bindings.
+    /// Runs that require external texture bindings or a hardware blend.
     pub(crate) external_texture_runs: Vec<ExternalTextureRun>,
     /// Whether any strip in this draw samples a child layer.
     pub(crate) has_child_layer: bool,
@@ -40,11 +40,13 @@ impl Draw {
         strips: &mut Vec<GpuStrip>,
         mut gpu_strip: GpuStrip,
         texture_source: Option<TextureSourceId>,
+        hardware_blend: Option<HardwareBlend>,
     ) {
         if let Some(slot) = assign_external_texture_slot(
             &mut self.external_texture_runs,
             self.strip_ranges.len(),
             texture_source,
+            hardware_blend,
         ) {
             gpu_strip.paint_and_rect_flag |= u32::from(slot) << EXTERNAL_TEXTURE_SLOT_SHIFT;
         }
@@ -74,6 +76,7 @@ impl OpaqueDraw {
             &mut self.external_texture_runs,
             self.strips.len(),
             texture_source,
+            None,
         ) {
             strip.paint_and_rect_flag |= u32::from(slot) << EXTERNAL_TEXTURE_SLOT_SHIFT;
         }
@@ -156,7 +159,7 @@ impl<'a, T: DrawTarget> DrawBuilder<'a, T> {
         match draw {
             RecordedDraw::Path(path) => self.push_path(path, strip_storage, paint_resolver),
             RecordedDraw::Rect(rect) => {
-                self.push_rect(&rect.rect, &rect.paint, paint_resolver);
+                self.push_rect(&rect.rect, &rect.paint, rect.hardware_blend, paint_resolver);
             }
         }
     }
@@ -177,8 +180,11 @@ impl<'a, T: DrawTarget> DrawBuilder<'a, T> {
         paint_resolver: PaintResolver<'_>,
     ) {
         let strips = &strip_storage.strips[path.strips.clone()];
+        let blend = path.hardware_blend;
 
-        let paint = paint_resolver.pack(&path.paint);
+        let mut paint = paint_resolver.pack(&path.paint);
+        // Opaque strips skip blending in the depth pass.
+        paint.opaque &= blend.is_none();
         // Note: This will also advance the depth index for layer root draws even though
         // those _currently_ never use the depth buffer, but it's better to keep the
         // condition simple, and it's not incorrect to do so.
@@ -207,7 +213,7 @@ impl<'a, T: DrawTarget> DrawBuilder<'a, T> {
 
                 builder
                     .draw
-                    .push(builder.strips, strip, paint.texture_source);
+                    .push(builder.strips, strip, paint.texture_source, blend);
             },
             |builder, segment| {
                 let shifted = segment.shift(geometry_shift);
@@ -224,13 +230,19 @@ impl<'a, T: DrawTarget> DrawBuilder<'a, T> {
                 if !paint.opaque || !builder.push_opaque(strip, paint.texture_source) {
                     builder
                         .draw
-                        .push(builder.strips, strip, paint.texture_source);
+                        .push(builder.strips, strip, paint.texture_source, blend);
                 }
             },
         );
     }
 
-    fn push_rect(&mut self, rect: &Rect, paint: &Paint, paint_resolver: PaintResolver<'_>) {
+    fn push_rect(
+        &mut self,
+        rect: &Rect,
+        paint: &Paint,
+        blend: Option<HardwareBlend>,
+        paint_resolver: PaintResolver<'_>,
+    ) {
         // Recordings might contain geometry that exceeds the actual layer
         // bounding box. This can happen when a clip path is associated with the layer.
         // Recordings will not cull those for us, so we need to do this manually here.
@@ -241,7 +253,9 @@ impl<'a, T: DrawTarget> DrawBuilder<'a, T> {
             return;
         }
 
-        let paint = paint_resolver.pack(paint);
+        let mut paint = paint_resolver.pack(paint);
+        // Opaque strips skip blending in the depth pass.
+        paint.opaque &= blend.is_none();
         let depth_index = self.state.depth_counter.next(paint.opaque);
 
         let split = split_rect(&clipped_rect);
@@ -267,7 +281,8 @@ impl<'a, T: DrawTarget> DrawBuilder<'a, T> {
             );
 
             if !(paint.opaque && part.frac == 0 && self.push_opaque(strip, paint.texture_source)) {
-                self.draw.push(self.strips, strip, paint.texture_source);
+                self.draw
+                    .push(self.strips, strip, paint.texture_source, blend);
             }
         }
     }
@@ -332,6 +347,7 @@ impl<'a, T: DrawTarget> DrawBuilder<'a, T> {
                     depth_index,
                 ),
                 None,
+                None,
             );
         }
     }
@@ -350,7 +366,7 @@ impl<'a, T: DrawTarget> DrawBuilder<'a, T> {
         let shifted = segment.shift(self.state.target.geometry_shift());
         let strip = GpuStrip::from_fill_segment(shifted, col_idx, payload, paint, depth_index);
 
-        self.draw.push(self.strips, strip, None);
+        self.draw.push(self.strips, strip, None, None);
     }
 }
 
@@ -500,39 +516,57 @@ impl ExternalTextureBindings {
     }
 }
 
-/// Specifies a run of strips that can be drawn with the same external texture bindings.
+/// Specifies a run of strips that can be drawn with the same external texture bindings and
+/// hardware blend.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ExternalTextureRun {
     /// External textures bound for the run.
     pub(crate) bindings: ExternalTextureBindings,
+    /// Fixed-function blend for the run, instead of source-over.
+    pub(crate) blend: Option<HardwareBlend>,
     /// Start index of the strip range for this run. The end is implicitly the start of the next
     /// run, or, for the last run, the total number of strips in the pass.
     pub(crate) strips_start: usize,
 }
 
+/// Assigns the strip about to be pushed at `strips_len` to a run, starting one where its texture
+/// does not fit the last run's bindings or its blend differs, and returns its texture slot.
+/// Without runs, every strip is drawn source-over without external textures.
 fn assign_external_texture_slot(
     runs: &mut Vec<ExternalTextureRun>,
     strips_len: usize,
     texture_source: Option<TextureSourceId>,
+    blend: Option<HardwareBlend>,
 ) -> Option<u8> {
-    let texture_source = texture_source?;
-
-    if let Some(slot) = runs
-        .last_mut()
-        .and_then(|run| run.bindings.get_or_insert(texture_source))
-    {
-        return Some(slot);
+    match runs.last_mut() {
+        None if texture_source.is_none() && blend.is_none() => return None,
+        // Earlier strips need neither, so a first run that only adds a texture may cover them.
+        None if blend.is_none() || strips_len == 0 => {}
+        None => runs.push(ExternalTextureRun {
+            bindings: ExternalTextureBindings::EMPTY,
+            blend: None,
+            strips_start: 0,
+        }),
+        Some(run) if run.blend == blend => match texture_source {
+            None => return None,
+            Some(texture_source) => {
+                if let Some(slot) = run.bindings.get_or_insert(texture_source) {
+                    return Some(slot);
+                }
+            }
+        },
+        Some(_) => {}
     }
 
     let mut bindings = ExternalTextureBindings::EMPTY;
-    let slot = bindings.get_or_insert(texture_source).unwrap();
-    let strips_start = if runs.is_empty() { 0 } else { strips_len };
+    let slot = texture_source.map(|texture_source| bindings.get_or_insert(texture_source).unwrap());
     runs.push(ExternalTextureRun {
         bindings,
-        strips_start,
+        blend,
+        strips_start: if runs.is_empty() { 0 } else { strips_len },
     });
 
-    Some(slot)
+    slot
 }
 
 /// Assigns monotonically increasing depth values to opaque strips.
@@ -594,7 +628,7 @@ mod tests {
         TextureSourceId,
     };
     use crate::render::common::{GpuEncodedImage, GpuEncodedPaint, encode_native_image_paint};
-    use crate::scene::{RecordedDraw, RecordedRect};
+    use crate::scene::{HardwareBlend, RecordedDraw, RecordedRect};
     use crate::target::{
         DrawTarget, LayerTextureId, LayerTextureRegion, RootTarget, TextureParity, TextureRegion,
     };
@@ -637,7 +671,22 @@ mod tests {
             paint: Paint,
             paint_resolver: PaintResolver<'_>,
         ) {
-            let recorded = RecordedDraw::Rect(RecordedRect { rect, paint });
+            self.blended_rect(draw, rect, paint, None, paint_resolver);
+        }
+
+        fn blended_rect(
+            &mut self,
+            draw: &mut Draw,
+            rect: Rect,
+            paint: Paint,
+            hardware_blend: Option<HardwareBlend>,
+            paint_resolver: PaintResolver<'_>,
+        ) {
+            let recorded = RecordedDraw::Rect(RecordedRect {
+                rect,
+                paint,
+                hardware_blend,
+            });
             DrawBuilder::new(draw, &mut self.buffers, &mut self.state).push_draw(
                 &recorded,
                 &self.strip_storage,
@@ -787,6 +836,44 @@ mod tests {
             },
             layer_bbox,
         }
+    }
+
+    #[test]
+    fn hardware_blends_start_runs_and_skip_the_opaque_pass() {
+        let mut case = DrawCase::new(RootTarget::UserSurface, RectU16::new(0, 0, 32, 8));
+        let mut draw = Draw::default();
+        let draws = [
+            (solid(0.5), None),
+            (solid(1.0), Some(HardwareBlend::Max)),
+            (solid(1.0), Some(HardwareBlend::Max)),
+            (solid(0.5), None),
+            (solid(1.0), Some(HardwareBlend::Add)),
+        ];
+
+        for (index, (paint, blend)) in draws.into_iter().enumerate() {
+            case.blended_rect(
+                &mut draw,
+                rect(index as f64 * 4.0),
+                paint,
+                blend,
+                no_paints(),
+            );
+        }
+
+        // Opaque paint goes to the depth pass only when drawn source-over.
+        assert!(case.buffers.opaque.is_empty());
+        assert_eq!(
+            draw.external_texture_runs
+                .iter()
+                .map(|run| (run.blend, run.strips_start))
+                .collect::<Vec<_>>(),
+            [
+                (None, 0),
+                (Some(HardwareBlend::Max), 1),
+                (None, 3),
+                (Some(HardwareBlend::Add), 4),
+            ]
+        );
     }
 
     #[test]

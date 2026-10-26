@@ -36,6 +36,7 @@ pub use error::{
 
 use crate::draw::{EXTERNAL_TEXTURE_SLOT_COUNT, ExternalTextureBindings, ExternalTextureRun};
 use crate::render::common::IMAGE_PADDING;
+use crate::scene::HardwareBlend;
 use crate::util::RangedSlice;
 use crate::{
     ClearSettings, GpuStrip, LayersConfig, RenderError, RenderSettings, RenderSize, Resources,
@@ -2825,14 +2826,33 @@ impl WebGlRendererContext<'_> {
                     .get(i + 1)
                     .map_or(count, |next| i32::try_from(next.strips_start).unwrap());
                 self.bind_external_textures(&run.bindings)?;
+                self.set_hardware_blend(run.blend);
                 self.draw_strip_range(first_instance + start, end - start);
             }
             self.bind_external_textures(&ExternalTextureBindings::EMPTY)?;
+            self.set_hardware_blend(None);
         }
 
         self.set_strip_attrib_offset(0);
 
         Ok(())
+    }
+
+    /// Source-over without a hardware blend, as every pass but strip runs expects.
+    fn set_hardware_blend(&self, blend: Option<HardwareBlend>) {
+        let (equation, destination) = match blend {
+            None => (
+                WebGl2RenderingContext::FUNC_ADD,
+                WebGl2RenderingContext::ONE_MINUS_SRC_ALPHA,
+            ),
+            Some(HardwareBlend::Add) => (
+                WebGl2RenderingContext::FUNC_ADD,
+                WebGl2RenderingContext::ONE,
+            ),
+            Some(HardwareBlend::Max) => (WebGl2RenderingContext::MAX, WebGl2RenderingContext::ONE),
+        };
+        self.gl.blend_equation(equation);
+        self.gl.blend_func(WebGl2RenderingContext::ONE, destination);
     }
 
     /// Draw `count` strip instances starting at `first_instance`.
