@@ -979,13 +979,41 @@ impl Scene {
         }
     }
 
+    /// The viewport that a filter layer pushed with `transform` inside a `width` × `height`
+    /// viewport records into: its size, and the transform it prepends to everything drawn in it.
+    /// A fragment recorded at that size, with that transform prepended, can be appended inside
+    /// the layer.
+    pub fn filter_layer_viewport(
+        width: u16,
+        height: u16,
+        filter: Filter,
+        transform: Affine,
+    ) -> ((u16, u16), Affine) {
+        let padding = FilterData::new(filter, transform).source_padding;
+        let size = (
+            width.saturating_add(padding.left).saturating_add(padding.right),
+            height.saturating_add(padding.top).saturating_add(padding.bottom),
+        );
+        let shift = Affine::translate((f64::from(padding.left), f64::from(padding.top)));
+        (size, shift)
+    }
+
+    /// Whether [`Scene::append`] accepts `other` now: it is closed and recorded at the active
+    /// viewport's size, and no clip path is open.
+    pub fn can_append(&self, other: &Self) -> bool {
+        (self.viewport_state.width(), self.viewport_state.height()) == (other.width, other.height)
+            && self.viewport_state.clip().is_none()
+            && !other.has_open_layers()
+    }
+
     /// Move `other`'s finished recording into the active layer, then reset `other`.
-    /// Both scenes must share a size; `self` must not be inside a clip path or filter layer.
+    /// `other` must be recorded at the active viewport's size: the scene's, or inside a filter
+    /// layer the one [`Scene::filter_layer_viewport`] gives. `self` must not be inside a clip path.
     pub fn append(&mut self, other: &mut Scene) {
         assert_eq!(
-            (self.width, self.height),
+            (self.viewport_state.width(), self.viewport_state.height()),
             (other.width, other.height),
-            "Appended scenes must share a size"
+            "Appended scenes must match the active viewport"
         );
         assert!(
             self.viewport_state.clip().is_none(),
@@ -1238,6 +1266,48 @@ mod tests {
         assert!(clip.strip_range.start >= strips_before);
         assert_eq!(scene.recorder.max_layer_depth, 3);
         assert!(!scene.root_is_blend_target());
+    }
+
+    #[test]
+    fn append_inside_filter_layer_matches_drawing_there() {
+        use alloc::vec::Vec;
+        use vello_common::filter_effects::{Filter, FilterFunction};
+        use vello_common::kurbo::{Affine, Shape};
+
+        let blur = || Filter::from_function(FilterFunction::Blur { radius: 6.0 });
+        let circle = vello_common::kurbo::Circle::new((20.0, 20.0), 10.0).to_path(0.1);
+        let strips = |scene: &Scene| {
+            let storage = scene.strip_storage.borrow();
+            storage
+                .strips
+                .iter()
+                .map(|strip| (strip.x, strip.y))
+                .collect::<Vec<_>>()
+        };
+
+        let mut direct = Scene::new(64, 64);
+        direct.push_filter_layer(blur());
+        direct.set_paint(BLUE);
+        direct.fill_path(&circle);
+
+        let (size, shift) = Scene::filter_layer_viewport(64, 64, blur(), Affine::IDENTITY);
+        assert_ne!(size, (64, 64));
+        let mut fragment = Scene::new(size.0, size.1);
+        fragment.set_transform(shift);
+        fragment.set_paint(BLUE);
+        fragment.fill_path(&circle);
+        let mut appended = Scene::new(64, 64);
+        appended.push_filter_layer(blur());
+        assert!(!appended.can_append(&Scene::new(64, 64)));
+        assert!(appended.try_append(&mut fragment));
+
+        direct.pop_layer();
+        appended.pop_layer();
+        assert_eq!(strips(&appended), strips(&direct));
+        assert_eq!(
+            appended.recorder.layers[0].bbox,
+            direct.recorder.layers[0].bbox
+        );
     }
 
     #[test]

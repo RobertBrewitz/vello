@@ -369,18 +369,12 @@ impl<D> CommandRecorder<D> {
     }
 
     /// Move a finished recording into the active layer. `map_draw` must shift the draw's
-    /// strip and paint references; clip strip ranges are shifted by `strip_offset`.
+    /// strip and paint references; clip strip ranges are shifted by `strip_offset`. Inside a
+    /// filter layer, `other` must be recorded in that layer's viewport.
     pub fn append(&mut self, other: &mut Self, strip_offset: usize, map_draw: impl FnMut(D) -> D) {
         assert!(
             other.layer_stack.is_empty(),
             "Close all layers before appending"
-        );
-        assert!(
-            self.layer_stack.iter().all(|open| matches!(
-                self.layers[open.id as usize].kind,
-                RecordedLayerKind::Regular
-            )),
-            "Cannot append inside a filter layer"
         );
         let draw_offset = self.draws.len() as u32;
         let layer_offset = self.layers.len() as u32;

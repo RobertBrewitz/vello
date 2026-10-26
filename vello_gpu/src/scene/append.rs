@@ -45,8 +45,11 @@ impl Scene {
     /// Build both scenes for the same viewport and final transforms. Resource handles in both
     /// scenes must resolve against the same rendering resources and texture bindings.
     ///
-    /// Returns `false`, leaving both scenes unchanged, if dimensions differ, either scene has
-    /// open layers or clip paths, or the combined recording would exceed its index limits.
+    /// Inside open layers this moves the recording into the active layer, as
+    /// [`Scene::append`] does.
+    ///
+    /// Returns `false`, leaving both scenes unchanged, if dimensions differ, `other` has open
+    /// layers, a clip path is open, or the combined recording would exceed its index limits.
     /// The caller can then use its ordinary drawing path instead.
     ///
     /// This moves owned payloads and copies/remaps buffer contents in linear time. It does not
@@ -90,6 +93,10 @@ impl Scene {
     /// A successful append consumes the fragment's recording; it is not a reusable cache.
     #[must_use]
     pub fn try_append(&mut self, other: &mut Self) -> bool {
+        if self.has_open_layers() && self.can_append(other) {
+            self.append(other);
+            return true;
+        }
         if self.width != other.width
             || self.height != other.height
             || !self.recording_is_closed()
