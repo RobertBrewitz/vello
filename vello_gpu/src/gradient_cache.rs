@@ -22,8 +22,8 @@ pub(crate) struct GradientRampCache {
     cache: HashMap<CacheKey<GradientCacheKey>, (CachedRamp, u64)>,
     /// Packed gradient luts.
     luts: Vec<u8>,
-    /// Whether the packed luts needs to be re-uploaded.
-    has_changed: bool,
+    /// Byte offset in the packed luts from which they need to be re-uploaded.
+    dirty_from: Option<usize>,
     /// Maximum number of gradient cache entries to retain.
     retained_count: u32,
     level: Level,
@@ -59,7 +59,7 @@ impl GradientRampCache {
             epoch: 0,
             cache: HashMap::new(),
             luts: Vec::new(),
-            has_changed: false,
+            dirty_from: None,
             retained_count,
             level,
             scratch: ScratchSpace::default(),
@@ -81,11 +81,11 @@ impl GradientRampCache {
         }
 
         // Generate new gradient LUT.
+        self.mark_dirty(self.luts.len());
         let lut_start = self.luts.len() as u32 / BYTES_PER_TEXEL;
         let width = dispatch!(self.level, simd => generate_gradient_lut_impl(simd, gradient, &mut self.luts))
             as u32;
         let cached_ramp = CachedRamp { width, lut_start };
-        self.has_changed = true;
         self.cache
             .insert(gradient.cache_key.clone(), (cached_ramp, self.epoch));
 
@@ -107,18 +107,35 @@ impl GradientRampCache {
     }
 
     /// Check if the packed luts is empty.
+    #[cfg_attr(
+        not(feature = "webgl"),
+        allow(dead_code, reason = "used by the WebGL backend")
+    )]
     pub(crate) fn is_empty(&self) -> bool {
         self.luts.is_empty()
     }
 
     /// Check if the luts data has changed.
+    #[cfg_attr(
+        not(feature = "webgl"),
+        allow(dead_code, reason = "used by the WebGL backend")
+    )]
     pub(crate) fn has_changed(&self) -> bool {
-        self.has_changed
+        self.dirty_from.is_some()
+    }
+
+    /// Byte offset in the luts from which they changed since the last sync.
+    pub(crate) fn dirty_from(&self) -> Option<usize> {
+        self.dirty_from
     }
 
     /// Mark the luts as synced.
     pub(crate) fn mark_synced(&mut self) {
-        self.has_changed = false;
+        self.dirty_from = None;
+    }
+
+    fn mark_dirty(&mut self, from: usize) {
+        self.dirty_from = Some(self.dirty_from.map_or(from, |dirty| dirty.min(from)));
     }
 
     /// Take ownership of the luts, leaving an empty vector in its place.
@@ -144,7 +161,6 @@ impl GradientRampCache {
         self.compact_luts(&mut lru_entries, &mut prefix_sum);
         self.scratch.lru_entries = lru_entries;
         self.scratch.prefix_sum = prefix_sum;
-        self.has_changed = true;
     }
 
     /// Identify and remove the LRU cache entries.
@@ -196,6 +212,8 @@ impl GradientRampCache {
         // See comment in `remove_lru_entries`, the entries are not sorted yet but need to be
         // for the prefix sum to work correctly.
         ramps_to_remove.sort_by_key(|(_, ramp)| ramp.lut_start);
+        // Everything from the first removed ramp on moves.
+        self.mark_dirty((ramps_to_remove[0].1.lut_start * BYTES_PER_TEXEL) as usize);
 
         // Compute a prefix sum of how much the `lut_start` entry of a given cached ramp needs
         // to be adjusted to account for compaction.
@@ -344,6 +362,30 @@ mod tests {
             hue_direction: HueDirection::Shorter,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn dirty_range_starts_at_the_first_changed_ramp() {
+        let mut cache = GradientRampCache::new(3, Level::baseline());
+        insert_entry(&mut cache, create_gradient(0.1));
+        assert_eq!(cache.dirty_from(), Some(0));
+        cache.mark_synced();
+
+        let before = cache.luts_size();
+        insert_entry(&mut cache, create_gradient(0.2));
+        assert_eq!(cache.dirty_from(), Some(before));
+        cache.mark_synced();
+
+        // A hit changes nothing.
+        insert_entry(&mut cache, create_gradient(0.2));
+        assert_eq!(cache.dirty_from(), None);
+
+        // Evicting the oldest moves everything after it.
+        insert_entry(&mut cache, create_gradient(0.3));
+        insert_entry(&mut cache, create_gradient(0.4));
+        cache.mark_synced();
+        cache.maintain();
+        assert_eq!(cache.dirty_from(), Some(0));
     }
 
     #[test]

@@ -2359,9 +2359,15 @@ impl Programs {
         let alpha_offset = self.upload_alpha_texture(device, queue, alphas);
         self.upload_filter_texture(device, queue, filter_context);
 
-        if gradient_cache.has_changed() {
-            self.maybe_resize_gradient_tex(device, resource_texture_dimension_2d, gradient_cache);
-            self.upload_gradient_texture(queue, gradient_cache);
+        if let Some(dirty_from) = gradient_cache.dirty_from() {
+            let resized = self.maybe_resize_gradient_tex(
+                device,
+                resource_texture_dimension_2d,
+                gradient_cache,
+            );
+            // A new texture takes every ramp; otherwise only the rows that changed.
+            let from = if resized { 0 } else { dirty_from };
+            self.upload_gradient_texture(queue, gradient_cache, from);
             gradient_cache.mark_synced();
         }
         alpha_offset
@@ -2380,13 +2386,13 @@ impl Programs {
         self.strips_arena.cursor = 0;
     }
 
-    /// Update the gradient texture size if needed.
+    /// Update the gradient texture size if needed, returning whether it was replaced.
     fn maybe_resize_gradient_tex(
         &mut self,
         device: &Device,
         resource_texture_dimension_2d: u32,
         gradient_cache: &GradientRampCache,
-    ) {
+    ) -> bool {
         let gradient_pixels = (gradient_cache.luts_size() / BYTES_PER_TEXEL as usize) as u32;
         let required_gradient_height = gradient_pixels.div_ceil(resource_texture_dimension_2d);
         debug_assert!(
@@ -2415,7 +2421,9 @@ impl Programs {
                     .gradient_texture
                     .create_view(&TextureViewDescriptor::default()),
             );
+            return true;
         }
+        false
     }
 
     /// Select the config buffer for the render size; renders at other sizes keep theirs.
@@ -2671,46 +2679,54 @@ impl Programs {
         );
     }
 
-    /// Upload gradient data to the texture.
-    fn upload_gradient_texture(&mut self, queue: &Queue, gradient_cache: &mut GradientRampCache) {
+    /// Upload the gradient LUT rows from byte offset `from` on.
+    fn upload_gradient_texture(
+        &mut self,
+        queue: &Queue,
+        gradient_cache: &mut GradientRampCache,
+        from: usize,
+    ) {
         let gradient_texture = &self.resources.gradient_texture;
-        let gradient_texture_width = gradient_texture.width();
-        let gradient_texture_height = gradient_texture.height();
-
-        // Upload the gradient LUT data
-        if !gradient_cache.is_empty() {
-            let total_capacity =
-                (gradient_texture_width * gradient_texture_height * BYTES_PER_TEXEL) as usize;
-
-            // Take ownership of the luts to avoid copying, then resize for texture padding
-            let mut luts = gradient_cache.take_luts();
-            let old_luts_len = luts.len();
-            luts.resize(total_capacity, 0);
-
-            queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: gradient_texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                &luts,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(gradient_texture_width * BYTES_PER_TEXEL),
-                    rows_per_image: Some(gradient_texture_height),
-                },
-                Extent3d {
-                    width: gradient_texture_width,
-                    height: gradient_texture_height,
-                    depth_or_array_layers: 1,
-                },
-            );
-
-            // Restore the luts back to the cache
-            luts.truncate(old_luts_len);
-            gradient_cache.restore_luts(luts);
+        let row_bytes = (gradient_texture.width() * BYTES_PER_TEXEL) as usize;
+        let luts_len = gradient_cache.luts_size();
+        let first_row = from / row_bytes;
+        let end_row = luts_len.div_ceil(row_bytes);
+        if first_row >= end_row {
+            return;
         }
+
+        // Take ownership of the luts to avoid copying, then pad the last row
+        let mut luts = gradient_cache.take_luts();
+        luts.resize(end_row * row_bytes, 0);
+        let rows = (end_row - first_row) as u32;
+
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: gradient_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: 0,
+                    y: first_row as u32,
+                    z: 0,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            &luts[first_row * row_bytes..],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(row_bytes as u32),
+                rows_per_image: Some(rows),
+            },
+            Extent3d {
+                width: gradient_texture.width(),
+                height: rows,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        // Restore the luts back to the cache
+        luts.truncate(luts_len);
+        gradient_cache.restore_luts(luts);
     }
 
     /// Uploads two strip slices (opaque then alpha) into the frame arena and
