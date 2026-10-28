@@ -81,3 +81,35 @@ With 1–3 done the frame becomes: background, world, a Multiply layer of `ambie
 ## Done
 
 - `Scene::append` (5514eb1d): merge separately recorded scenes into one render.
+
+# TODO: textured strokes
+
+Paint a stroke with an image mapped along the path: u is the arc length from the path's
+start, v runs across the stroke's width. Art tools call it a pattern or art brush. Wanted
+for a creature's tongue in the engine's twin_stick_shooter, and for trails, rope and cables.
+
+- `PaintType::Image` today sits in paint space; a stroke painted with it shows the image
+  through the stroke's shape, not along it.
+- u starts at the path's start and is never normalized to its length, so a growing path
+  uncovers more texture at its end and nothing already drawn moves. Repeat or clamp along
+  u, per the image's extend.
+- Joins and caps: u carries on round joins; v is clamped across the width.
+- A possible route, unverified: arc length is known per segment at flattening; carry it per strip into the fine stage and
+  sample the image there instead of in paint space.
+- Until then the engine draws one image-painted quad per segment, transformed to the
+  segment.
+
+# TODO: upstream one submit per frame
+
+ab30af84 makes renders inside `begin_frame` / `end_frame` append to the shared uploads,
+shifting alpha columns, paint indices, filter offsets and strip ranges, so the engine
+submits once per frame instead of ~19 times. Upstream can't take it alone: frames
+(2931aea7) and flat groups (6aef7894) are fork-only.
+
+- Measure in the engine's `apps/perf` (gpu_timing off), before and after ab30af84 + engine
+  f5e1663f: frame time and `cpu_world_ms`.
+- If it's a clear win, open an issue on linebender/vello with the numbers: many small renders
+  per frame, each forced into its own submit by the shared uploads; propose explicit
+  frames plus appended uploads.
+- If maintainers are interested, follow with a PR against upstream `vello_gpu` as it stands.
+- Until then keep it in the fork.
